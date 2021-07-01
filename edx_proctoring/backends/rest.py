@@ -7,7 +7,7 @@ import logging
 import time
 import uuid
 import warnings
-from urllib.parse import urlparse  # pylint: disable=import-error, wrong-import-order
+from urllib.parse import urlencode, urlparse  # pylint: disable=import-error, wrong-import-order
 
 import jwt
 from edx_rest_api_client.client import OAuthAPIClient
@@ -21,6 +21,7 @@ from edx_proctoring.exceptions import (
     BackendProviderCannotRegisterAttempt,
     BackendProviderCannotRetireUser,
     BackendProviderOnboardingException,
+    BackendProviderOnboardingProfilesException,
     BackendProviderSentNoAttemptID
 )
 from edx_proctoring.statuses import ProctoredExamStudentAttemptStatus, SoftwareSecureReviewStatus
@@ -77,6 +78,11 @@ class BaseRestProctoringProvider(ProctoringBackendProvider):
         return self.base_url + u'/api/v1/user/{user_id}/'
 
     @property
+    def onboarding_statuses_url(self):
+        "Returns the onboarding statuses url"
+        return self.base_url + u'/api/v1/courses/{course_id}/onboarding_statuses'
+
+    @property
     def proctoring_instructions(self):
         "Returns the (optional) proctoring instructions"
         return []
@@ -87,12 +93,10 @@ class BaseRestProctoringProvider(ProctoringBackendProvider):
         client_id: provided by backend service
         client_secret: provided by backend service
         """
-        ProctoringBackendProvider.__init__(self)
+        self.default_rules = None
+        super().__init__(**kwargs)
         self.client_id = client_id
         self.client_secret = client_secret
-        self.default_rules = None
-        for key, value in kwargs.items():
-            setattr(self, key, value)
         self.session = OAuthAPIClient(self.base_url, self.client_id, self.client_secret)
 
     def get_javascript(self):
@@ -184,7 +188,11 @@ class BaseRestProctoringProvider(ProctoringBackendProvider):
         payload['status'] = 'created'
         # attempt code isn't needed in this API
         payload.pop('attempt_code', False)
-        log.debug(u'Creating exam attempt for %r at %r', exam['external_id'], url)
+        log.debug(
+            'Creating exam attempt for exam_id={exam_id} (external_id={external_id}) at {url}'.format(
+                exam_id=exam['id'], external_id=exam['external_id'], url=url
+            )
+        )
         response = self.session.post(url, json=payload)
         if response.status_code != 200:
             raise BackendProviderCannotRegisterAttempt(response.content, response.status_code)
@@ -264,7 +272,7 @@ class BaseRestProctoringProvider(ProctoringBackendProvider):
             url = self.exam_url.format(exam_id=external_id)
         else:
             url = self.create_exam_url
-        log.info(u'Saving exam to %r', url)
+        log.info('Saving exam_id={exam_id} to {url}'.format(exam_id=exam['id'], url=url))
         response = None
         try:
             response = self.session.post(url, json=exam)
@@ -275,7 +283,11 @@ class BaseRestProctoringProvider(ProctoringBackendProvider):
                 content = exc.response.content if hasattr(exc, 'response') else response.content
             else:
                 content = None
-            log.exception(u'failed to save exam. %r', content)
+            log.exception(
+                'Failed to save exam_id={exam_id} to {url}. Response: {content}'.format(
+                    exam_id=exam['id'], url=url, content=content
+                )
+            )
             data = {}
         return data.get('id')
 
@@ -304,7 +316,12 @@ class BaseRestProctoringProvider(ProctoringBackendProvider):
         encoded = jwt.encode(token, self.client_secret).decode('utf-8')
         url = self.instructor_url.format(client_id=self.client_id, jwt=encoded)
 
-        log.debug(u'Created instructor url for %r %r %r', course_id, exam_id, attempt_id)
+        log.debug(
+            'Created instructor url for course_id={course_id} exam_id={exam_id} '
+            'attempt_id={attempt_id}'.format(
+                course_id=course_id, exam_id=exam_id, attempt_id=attempt_id
+            )
+        )
         return url
 
     def retire_user(self, user_id):
@@ -316,7 +333,20 @@ class BaseRestProctoringProvider(ProctoringBackendProvider):
         except Exception as exc:  # pylint: disable=broad-except
             # pylint: disable=no-member
             content = exc.response.content if hasattr(exc, 'response') else response.content
-            raise BackendProviderCannotRetireUser(content)
+            raise BackendProviderCannotRetireUser(content) from exc
+        return data
+
+    def get_onboarding_profile_info(self, course_id, **kwargs):
+        url = self.onboarding_statuses_url.format(course_id=course_id)
+        if kwargs:
+            query_string = urlencode(kwargs)
+            url += '?' + query_string
+
+        response = self.session.get(url)
+
+        if response.status_code != 200:
+            raise BackendProviderOnboardingProfilesException(response.content, response.status_code)
+        data = response.json()
         return data
 
     def _get_language_headers(self):

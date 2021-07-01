@@ -1,15 +1,23 @@
 Proctoring System Overview
 ===========================
 This document outlines the components involved in the edX proctoring system. It should
-serve as a guide to orient developers on what components exist, how they interact, and 
+serve as a guide to orient developers on what components exist, how they interact, and
 where to find the source code in our platform.
 
 .. contents::
 
 System Components
-------------------
+-----------------
+
+Legacy Components Schema
+^^^^^^^^^^^^^^^^^^^^^^^^
 
 .. image:: images/components.png
+
+New Components Schema with Learning MFE and special exam lib
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. image:: images/components_with_mfe.png
 
 Proctored Exam Views
 ^^^^^^^^^^^^^^^^^^^^
@@ -28,6 +36,8 @@ Notable Code:
 - `LMS render student_view() <https://github.com/edx/edx-platform/blob/a7dff8c21ee794e90bdc0f22876334a7843a032d/common/lib/xmodule/xmodule/seq_module.py#L274>`_
 - `edx-proctoring template logic <https://github.com/edx/edx-proctoring/blob/78976d93ab6ca5206f259dc420d2f45818fe636c/edx_proctoring/api.py#L1912>`_
 - `edx-proctoring interstitial templates <https://github.com/edx/edx-proctoring/tree/323ea43acbd6f12d5131546e8648dedff719bf9e/edx_proctoring/templates>`_
+- `Learning MFE <https://github.com/edx/frontend-app-learning>`_
+- `React lib for special exams <https://github.com/edx/frontend-lib-special-exams/>`_
 
 edx-proctoring
 ^^^^^^^^^^^^^^
@@ -64,19 +74,19 @@ JavaScript Worker
 ^^^^^^^^^^^^^^^^^
 This is an optional component currently used by Proctortrack and our Mockprock provider.
 
-A JavaScript worker included as part of the the provider's python plugin. This will 
+A JavaScript worker included as part of the the provider's python plugin. This will
 handle any messages emitted by the edX web application and interface directly with the
-proctoring software running on the learner's machine. 
+proctoring software running on the learner's machine.
 
 Example worker: `proctortrack_custom.js <https://github.com/joshivj/edx-proctoring-proctortrack/blob/master/edx_proctoring_proctortrack/static/proctortrack_custom.js>`_
 
-See `Example Action Sequence <>`_ for how this interface fits into the exam process.
+See `Example Action Sequence`_ for how this interface fits into the exam process.
 
 Exam States
 -----------
 When a learner first enters a proctored exam subsection an exam attempt is created
 in the edX system. User actions and the proctoring provider will update the status of
-this attempt as the exam is completed and reviewed. The following diagram describes the 
+this attempt as the exam is completed and reviewed. The following diagram describes the
 flow through those status updates.
 
 Detailed descriptions of each potential attempt state can be found below. It should be noted that there
@@ -92,9 +102,18 @@ This figure does not include error states or display of unmet prerequite require
 Example Action Sequence
 -------------------------
 
-The diagram below describes the happy-path of interactions between components to 
-sucessfully begin a proctored exam. This example matches Proctortrack's backend
+The diagrams below describes the happy-path of interactions between components to
+sucessfully begin a proctored exam. These examples matches Proctortrack's backend
 implementation and includes any JavaScript events handled by the proctoring app.
+
+Old Sequence
+^^^^^^^^^^^^
 
 
 .. image:: images/sequence.png
+
+New Sequence with Learning MFE and special exam lib
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+
+.. image:: images/sequence_mfe.png

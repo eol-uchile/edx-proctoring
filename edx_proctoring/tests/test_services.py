@@ -124,6 +124,8 @@ class MockInstructorService:
         """
         self.is_user_course_staff = is_user_course_staff
         self.notifications = []
+        self.proctoring_escalation_email = None
+        self.proctoring_escalation_error = None
 
     # pylint: disable=unused-argument
     def delete_student_attempt(self, student_identifier, course_id, content_id, requesting_user):
@@ -133,6 +135,12 @@ class MockInstructorService:
         # Ensure that this method was called with a real user object
         if not hasattr(requesting_user, 'id'):
             raise UserNotFoundException
+        return True
+
+    def complete_student_attempt(self, user_identifier, content_id):
+        """
+        Mock implementation
+        """
         return True
 
     def is_course_staff(self, user, course_id):
@@ -146,6 +154,26 @@ class MockInstructorService:
         Mocked implementation of send_support_notification
         """
         self.notifications.append((course_id, exam_name, student_username, review_status, review_url))
+
+    def get_proctoring_escalation_email(self, course_key):  # pylint: disable=unused-argument
+        """
+        Get a mock return value for get_proctoring_escalation_email
+        """
+        if self.proctoring_escalation_error:
+            raise self.proctoring_escalation_error
+        return self.proctoring_escalation_email
+
+    def mock_proctoring_escalation_email(self, email):
+        """
+        Change the default return value for get_proctoring_escalation_email
+        """
+        self.proctoring_escalation_email = email
+
+    def mock_proctoring_escalation_email_error(self, error):
+        """
+        Mock an error that raises from get_proctoring_escalation_email
+        """
+        self.proctoring_escalation_error = error
 
 
 class TestProctoringService(unittest.TestCase):
@@ -285,3 +313,74 @@ class MockCertificateService:
         Returns invalidated certificate for key (user_id + course_key)
         """
         return self.generated_certificate.get((user_id, course_key_or_id))
+
+
+class MockEnrollment:
+    """
+    Mock Enrollment
+    """
+    def __init__(self, user, mode):
+        self.user = user
+        self.mode = mode
+
+
+class MockEnrollmentsService:
+    """Mock Enrollments service"""
+    def __init__(self, enrollments):
+        """Initialize mock enrollments"""
+        self.enrollments = (
+            [MockEnrollment(enrollment['user'], enrollment['mode']) for enrollment in enrollments]
+        )
+
+    def get_active_enrollments_by_course(self, course_id):
+        """Returns mock enrollments"""
+        return self.enrollments
+
+    def get_enrollments_can_take_proctored_exams(self, course_id, text_search=None):
+        """ Return mock enrollments"""
+        return self.enrollments
+
+
+class MockUserCourseOutlineDetailsData:
+    """Mock Outline Deatils"""
+    def __init__(self, outline, schedule):
+        self.outline = outline
+        self.schedule = schedule
+
+
+class MockUserCourseOutlineData:
+    """Mock Outline"""
+    def __init__(self, accessible_sequences):
+        self.accessible_sequences = accessible_sequences
+
+
+class MockScheduleData:
+    """Mock Outline Schedule"""
+    def __init__(self, schedule_items, course_end=None):
+        self.sequences = schedule_items
+        self.course_end = course_end
+
+
+class MockScheduleItemData:
+    """Mock Schedule Item"""
+    def __init__(self, effective_start, due_date=None):
+        self.effective_start = effective_start
+        self.due = due_date
+
+
+class MockLearningSequencesService:
+    """Mock Learner Sequences Service"""
+    def __init__(self, accessible_sequences, schedule_items):
+        self.accessible_sequences = accessible_sequences
+        self.schedule_items = schedule_items
+
+    def get_user_course_outline_details(self, course_key, user, at_time):
+        """ Return mock UserCourseOutlineDetailsData """
+        return MockUserCourseOutlineDetailsData(
+            MockUserCourseOutlineData(self.accessible_sequences),
+            MockScheduleData(self.schedule_items),
+        )
+
+    def get_user_course_outline(self, course_key, user, at_time):
+        """ Return mock UserCourseOutlineData """
+        return MockUserCourseOutlineData(self.accessible_sequences)

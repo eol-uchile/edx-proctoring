@@ -1,3 +1,13 @@
+/* eslint-disable camelcase */
+/* eslint-disable no-use-before-define */
+/* eslint-disable vars-on-top */
+var eol = 0;
+if (typeof eol_proctored_exam_get_progress !== 'undefined') {
+    eol = 1;
+}
+var eol_proctored_exam_alertExamEnding = eol_proctored_exam_alertExamEnding || function() { 'use strict'; };
+var eol_proctored_exam_get_progress = eol_proctored_exam_get_progress || function() { 'use strict'; };
+
 edx = edx || {};
 
 (function(Backbone, $, _, gettext) {
@@ -102,11 +112,11 @@ edx = edx || {};
                     this.model.get('time_remaining_seconds') > 0 &&
                     this.model.get('attempt_status') !== 'error'
                 ) {
-            
-                    // Init seconds
-                    this.secondsToEnd = this.model.get('time_remaining_seconds');
-                    this.startSecond = Math.floor(new Date().getTime() / 1000);
-
+                    if (eol === 1) {
+                        // Init seconds
+                        this.secondsToEnd = this.model.get('time_remaining_seconds');
+                        this.startSecond = Math.floor(new Date().getTime() / 1000);
+                    }
                     // add callback on scroll event
                     $(window).bind('scroll', this.detectScroll);
 
@@ -144,7 +154,6 @@ edx = edx || {};
                             }
                         });
                     });
-
                     // get student progress
                     $('.eol-exam-button-turn-in-exam').click(function() {
                         eol_proctored_exam_get_progress(
@@ -175,7 +184,11 @@ edx = edx || {};
             var self = this;
             var pingInterval = self.model.get('ping_interval');
             self.timerTick += 1;
-            self.secondsLeft = self.startSecond + self.secondsToEnd - Math.floor(new Date().getTime() / 1000);
+            if (eol === 1) {
+                self.secondsLeft = (self.startSecond + self.secondsToEnd) - Math.floor(new Date().getTime() / 1000);
+            } else {
+                self.secondsLeft -= 1;
+            }
 
             // AED 2020-02-21:
             // If the learner is in a state where they've finished the exam
@@ -188,23 +201,34 @@ edx = edx || {};
                 this.model.get('attempt_status') !== 'ready_to_submit'
             ) {
                 edx.courseware.proctored_exam.pingApplication(pingInterval)
-                    .catch(self.endExamForFailureState.bind(self));
+                    .catch(function(error) {
+                        self.endExamForFailureState(error);
+                    });
             }
             if (self.timerTick % self.poll_interval === 0) {
                 url = self.model.url + '/' + self.model.get('attempt_id');
                 queryString = '?sourceid=in_exam&proctored=' + self.model.get('taking_as_proctored');
-                $.ajax(url + queryString).success(function(data) {
-                    if (data.status === 'error') {
-                        // The proctoring session is in error state
-                        // refresh the page to bring up the new Proctoring state from the backend.
-                        clearInterval(self.timerId); // stop the timer once the time finishes.
-                        $(window).unbind('beforeunload', self.unloadMessage);
-                        location.reload();
-                    } else {
-                        self.secondsLeft = data.time_remaining_seconds;
-                        self.accessibility_time_string = data.accessibility_time_string;
-                    }
-                });
+                $.ajax(url + queryString)
+                    .success(function(data) {
+                        if (data.status === 'error') {
+                            // The proctoring session is in error state
+                            // refresh the page to bring up the new Proctoring state from the backend.
+                            clearInterval(self.timerId); // stop the timer once the time finishes.
+                            $(window).unbind('beforeunload', self.unloadMessage);
+                            self.reloadPage();
+                        } else {
+                            self.secondsLeft = data.time_remaining_seconds;
+                            self.accessibility_time_string = data.accessibility_time_string;
+                        }
+                    })
+                    .error(function(error) {
+                        // if unauthorized refresh the page to kick user out of exam
+                        if (error.status === 403) {
+                            clearInterval(self.timerId);
+                            $(window).unbind('beforeunload', self.unloadMessage);
+                            self.reloadPage();
+                        }
+                    });
             }
             self.$el.find('div.exam-timer').attr('class');
             newState = self.model.getRemainingTimeState(self.secondsLeft);
@@ -224,11 +248,12 @@ edx = edx || {};
                 edx.courseware.proctored_exam.endExam(self.model.get('exam_started_poll_url')).then(self.reloadPage);
             }
         },
-        endExamForFailureState: function() {
+        endExamForFailureState: function(error) {
             var self = this;
             return $.ajax({
                 data: {
-                    action: 'error'
+                    action: 'error',
+                    detail: String(error)
                 },
                 url: this.model.url + '/' + this.model.get('attempt_id'),
                 type: 'PUT'

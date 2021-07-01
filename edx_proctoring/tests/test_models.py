@@ -4,6 +4,8 @@
 All tests for the models.py
 """
 
+from django.contrib.auth import get_user_model
+
 from edx_proctoring.models import (
     ProctoredExam,
     ProctoredExamReviewPolicy,
@@ -17,6 +19,8 @@ from edx_proctoring.statuses import ProctoredExamStudentAttemptStatus
 
 from .utils import LoggedInTestCase
 
+User = get_user_model()
+
 # pragma pylint: disable=useless-super-delegation
 
 
@@ -29,7 +33,7 @@ class ProctoredExamModelTests(LoggedInTestCase):
         """
         Build out test harnessing
         """
-        super(ProctoredExamModelTests, self).setUp()
+        super().setUp()
 
     def test_unicode(self):
         """
@@ -140,6 +144,45 @@ class ProctoredExamModelTests(LoggedInTestCase):
 
         proctored_exam_student_history = ProctoredExamStudentAllowanceHistory.objects.filter(user_id=1)
         self.assertEqual(len(proctored_exam_student_history), 1)
+
+    def test_get_practice_proctored_exams_for_course(self):
+        """
+        Test get_practice_proctored_exams_for_course method returns only active
+        practice proctored exams.
+        """
+        course_id = 'test_course'
+        # create proctored exam
+        ProctoredExam.objects.create(
+            course_id=course_id,
+            content_id='test_content_1',
+            exam_name='Test Exam',
+            external_id='123aXqe3',
+            time_limit_mins=90,
+            is_active=True,
+            is_proctored=True,
+        )
+        # create practice proctored exam
+        ProctoredExam.objects.create(
+            course_id=course_id,
+            content_id='test_content_2',
+            exam_name='Test Exam',
+            external_id='123aXqe3',
+            time_limit_mins=90,
+            is_active=True,
+            is_proctored=True,
+            is_practice_exam=True,
+        )
+        practice_proctored_exams = ProctoredExam.objects.filter(
+            course_id=course_id,
+            is_active=True,
+            is_proctored=True,
+            is_practice_exam=True
+        )
+
+        self.assertQuerysetEqual(
+            ProctoredExam.get_practice_proctored_exams_for_course(course_id),
+            [repr(exam) for exam in practice_proctored_exams]
+        )
 
 
 class ProctoredExamStudentAttemptTests(LoggedInTestCase):
@@ -279,8 +322,9 @@ class ProctoredExamStudentAttemptTests(LoggedInTestCase):
 
         # create number of exam attempts
         for i in range(90):
+            user = User.objects.create(username='tester{0}'.format(i), email='tester{0}@test.com'.format(i))
             ProctoredExamStudentAttempt.create_exam_attempt(
-                proctored_exam.id, i, 'test_name{0}'.format(i),
+                proctored_exam.id, user.id, 'test_name{0}'.format(i),
                 'test_attempt_code{0}'.format(i), True, False, 'test_external_id{0}'.format(i)
             )
 
@@ -365,3 +409,53 @@ class ProctoredExamStudentAttemptTests(LoggedInTestCase):
         attempts = ProctoredExamStudentAttemptHistory.objects.all()
         self.assertEqual(len(attempts), 1)
         self.assertEqual(attempts[0].review_policy_id, deleted_id)
+
+    def test_exam_attempt_is_resumable(self):
+        # Create an exam.
+        proctored_exam = ProctoredExam.objects.create(
+            course_id='a/b/c',
+            content_id='test_content',
+            exam_name='Test Exam',
+            external_id='123aXqe3',
+            time_limit_mins=90
+        )
+        # Create a user and their attempt
+        user = User.objects.create(username='testerresumable', email='testerresumable@test.com')
+        ProctoredExamStudentAttempt.create_exam_attempt(
+            proctored_exam.id, user.id, 'test_name_resumable',
+            'test_attempt_code_resumable', True, False, 'test_external_id_resumable'
+        )
+
+        filter_query = {
+            'user_id': user.id,
+            'proctored_exam_id': proctored_exam.id
+        }
+
+        attempt = ProctoredExamStudentAttempt.objects.get(**filter_query)
+        self.assertFalse(attempt.is_resumable)
+
+        # No entry in the History table on creation of the Allowance entry.
+        attempt_history = ProctoredExamStudentAttemptHistory.objects.filter(**filter_query)
+        self.assertEqual(len(attempt_history), 0)
+
+        # Saving as an error status
+        attempt.is_resumable = True
+        attempt.status = ProctoredExamStudentAttemptStatus.error
+        attempt.save()
+
+        attempt = ProctoredExamStudentAttempt.objects.get(**filter_query)
+        self.assertTrue(attempt.is_resumable)
+
+        attempt_history = ProctoredExamStudentAttemptHistory.objects.filter(**filter_query)
+        self.assertEqual(len(attempt_history), 1)
+        self.assertFalse(attempt_history.first().is_resumable)
+
+        # Saving as a Reviewed status, but not changing is_resumable
+        attempt.status = ProctoredExamStudentAttemptStatus.verified
+        attempt.save()
+        attempt = ProctoredExamStudentAttempt.objects.get(**filter_query)
+        self.assertTrue(attempt.is_resumable)
+
+        attempt_history = ProctoredExamStudentAttemptHistory.objects.filter(**filter_query)
+        self.assertEqual(len(attempt_history), 2)
+        self.assertTrue(attempt_history.last().is_resumable)

@@ -3,7 +3,7 @@
 from rest_framework import serializers
 from rest_framework.fields import DateTimeField
 
-from django.contrib.auth.models import User
+from django.contrib.auth import get_user_model
 
 from edx_proctoring.models import (
     ProctoredExam,
@@ -11,6 +11,8 @@ from edx_proctoring.models import (
     ProctoredExamStudentAllowance,
     ProctoredExamStudentAttempt
 )
+
+User = get_user_model()
 
 
 class ProctoredExamSerializer(serializers.ModelSerializer):
@@ -94,7 +96,8 @@ class ProctoredExamStudentAttemptSerializer(serializers.ModelSerializer):
             "id", "created", "modified", "user", "started_at", "completed_at",
             "external_id", "status", "proctored_exam", "allowed_time_limit_mins",
             "attempt_code", "is_sample_attempt", "taking_as_proctored", "last_poll_timestamp",
-            "last_poll_ipaddr", "review_policy_id", "student_name", "is_status_acknowledged"
+            "last_poll_ipaddr", "review_policy_id", "student_name", "is_status_acknowledged",
+            "time_remaining_seconds", "is_resumable"
         )
 
 

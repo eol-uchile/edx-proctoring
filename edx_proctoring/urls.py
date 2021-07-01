@@ -9,6 +9,8 @@ from edx_proctoring import callbacks, instructor_dashboard_exam_urls, views
 
 app_name = u'edx_proctoring'
 
+CONTENT_ID_PATTERN = r'(?P<content_id>([A-z0-9]+|(?:i4x://?[^/]+/[^/]+/[^/]+/[^@]+(?:@[^/]+)?)|(?:[^/]+)))'
+
 urlpatterns = [
     url(
         r'edx_proctoring/v1/proctored_exam/exam$',
@@ -38,15 +40,15 @@ urlpatterns = [
         name='proctored_exam.attempt'
     ),
     url(
-        r'edx_proctoring/v1/proctored_exam/attempt/course_id/{}$'.format(settings.COURSE_ID_PATTERN),
-        views.StudentProctoredExamAttemptsByCourse.as_view(),
-        name='proctored_exam.attempts.course'
+        r'edx_proctoring/v1/proctored_exam/attempt/grouped/course_id/{}$'.format(settings.COURSE_ID_PATTERN),
+        views.StudentProctoredGroupedExamAttemptsByCourse.as_view(),
+        name='proctored_exam.attempts.grouped.course'
     ),
     url(
-        r'edx_proctoring/v1/proctored_exam/attempt/course_id/{}/search/(?P<search_by>.+)$'.format(
+        r'edx_proctoring/v1/proctored_exam/attempt/grouped/course_id/{}/search/(?P<search_by>.+)$'.format(
             settings.COURSE_ID_PATTERN),
-        views.StudentProctoredExamAttemptsByCourse.as_view(),
-        name='proctored_exam.attempts.search'
+        views.StudentProctoredGroupedExamAttemptsByCourse.as_view(),
+        name='proctored_exam.attempts.grouped.search'
     ),
     url(
         r'edx_proctoring/v1/proctored_exam/attempt$',
@@ -79,9 +81,34 @@ urlpatterns = [
         name='proctored_exam.allowance'
     ),
     url(
+        r'edx_proctoring/v1/proctored_exam/{}/bulk_allowance$'.format(settings.COURSE_ID_PATTERN),
+        views.ExamBulkAllowanceView.as_view(),
+        name='proctored_exam.bulk_allowance'
+    ),
+    url(
+        r'edx_proctoring/v1/proctored_exam/bulk_allowance$',
+        views.ExamBulkAllowanceView.as_view(),
+        name='proctored_exam.bulk_allowance'
+    ),
+    url(
+        r'edx_proctoring/v1/proctored_exam/allowance/grouped/course_id/{}$'.format(settings.COURSE_ID_PATTERN),
+        views.GroupedExamAllowancesByStudent.as_view(),
+        name='proctored_exam.allowance.grouped.course'
+    ),
+    url(
         r'edx_proctoring/v1/proctored_exam/active_exams_for_user$',
         views.ActiveExamsForUserView.as_view(),
         name='proctored_exam.active_exams_for_user'
+    ),
+    url(
+        r'edx_proctoring/v1/user_onboarding/status$',
+        views.StudentOnboardingStatusView.as_view(),
+        name='user_onboarding.status'
+    ),
+    url(
+        r'edx_proctoring/v1/user_onboarding/status/course_id/{}$'.format(settings.COURSE_ID_PATTERN),
+        views.StudentOnboardingStatusByCourseView.as_view(),
+        name='user_onboarding.status.course'
     ),
     url(
         r'edx_proctoring/v1/instructor/{}$'.format(settings.COURSE_ID_PATTERN),
@@ -98,6 +125,22 @@ urlpatterns = [
         views.UserRetirement.as_view(),
         name='user_retirement_api'
     ),
+    url(
+        r'edx_proctoring/v1/proctored_exam/attempt/course_id/{}/content_id/{}$'.format(
+            settings.COURSE_ID_PATTERN, CONTENT_ID_PATTERN),
+        views.ProctoredExamAttemptView.as_view(),
+        name='proctored_exam.exam_attempts'
+    ),
+    url(
+        r'edx_proctoring/v1/proctored_exam/settings/exam_id/(?P<exam_id>\d+)/$',
+        views.ProctoredSettingsView.as_view(),
+        name='proctored_exam.proctoring_settings'
+    ),
+    url(
+        r'edx_proctoring/v1/proctored_exam/review_policy/exam_id/(?P<exam_id>\d+)/$',
+        views.ProctoredExamReviewPolicyView.as_view(),
+        name='proctored_exam.review_policy'
+    ),
 
     # Unauthenticated callbacks from SoftwareSecure. Note we use other
     # security token measures to protect data
@@ -112,7 +155,12 @@ urlpatterns = [
         views.AnonymousReviewCallback.as_view(),
         name='anonymous.proctoring_review_callback'
     ),
-    url(r'^', include('rest_framework.urls', namespace='rest_framework'))
+    url(
+        r'edx_proctoring/v1/proctored_exam/exam_id/(?P<exam_id>\d+)/user_id/(?P<user_id>[\d]+)/reset_attempts$',
+        views.StudentProctoredExamResetAttempts.as_view(),
+        name='proctored_exam.attempts.reset'
+    ),
+    url(r'^', include('rest_framework.urls', namespace='rest_framework')),
 ]
 
 urlpatterns += instructor_dashboard_exam_urls.urlpatterns

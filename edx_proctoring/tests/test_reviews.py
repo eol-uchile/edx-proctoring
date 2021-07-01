@@ -5,10 +5,11 @@ Review callback tests
 import json
 
 import ddt
+import mock
 from crum import set_current_request
 from mock import call, patch
 
-from django.contrib.auth.models import User
+from django.contrib.auth import get_user_model
 from django.test import RequestFactory
 from django.urls import reverse
 
@@ -36,6 +37,8 @@ from edx_proctoring.views import ProctoredExamReviewCallback, is_user_course_or_
 
 from .utils import LoggedInTestCase
 
+User = get_user_model()
+
 
 @ddt.ddt
 class ReviewTests(LoggedInTestCase):
@@ -43,7 +46,7 @@ class ReviewTests(LoggedInTestCase):
     Tests for reviews
     """
     def setUp(self):
-        super(ReviewTests, self).setUp()
+        super().setUp()
         self.dummy_request = RequestFactory().get('/')
         self.exam_creation_params = {
             'course_id': 'foo/bar/baz',
@@ -69,7 +72,7 @@ class ReviewTests(LoggedInTestCase):
         set_current_request(self.dummy_request)
 
     def tearDown(self):
-        super(ReviewTests, self).tearDown()
+        super().tearDown()
         set_runtime_service('credit', None)
         set_runtime_service('grades', None)
         set_runtime_service('certificates', None)
@@ -506,8 +509,8 @@ class ReviewTests(LoggedInTestCase):
         )
 
         log_format_string = (
-            u'User %(user)s does not have the required permissions '
-            u'to submit a review for attempt_code %(attempt_code)s.'
+            'user=%(user)s does not have the required permissions '
+            'to submit a review for attempt_code=%(attempt_code)s.'
         )
 
         log_format_dictionary = {
@@ -531,3 +534,24 @@ class ReviewTests(LoggedInTestCase):
             self.assertFalse(
                 call(log_format_string, log_format_dictionary) in logger_mock.call_args_list
             )
+
+    def test_review_update_attempt_active_field(self):
+        """
+        Make sure we update the is_active_attempt field when an attempt is archived
+        """
+        test_payload = self.get_review_payload(ReviewStatus.passed)
+        ProctoredExamReviewCallback().make_review(self.attempt, test_payload)
+
+        review = ProctoredExamSoftwareSecureReview.get_review_by_attempt_code(self.attempt['attempt_code'])
+        self.assertTrue(review.is_attempt_active)
+
+        # now delete the attempt, which puts it into the archive table
+        with mock.patch('edx_proctoring.api.update_attempt_status') as mock_update_status:
+            remove_exam_attempt(self.attempt_id, requesting_user=self.user)
+
+        # check that the field has been updated
+        review = ProctoredExamSoftwareSecureReview.get_review_by_attempt_code(self.attempt['attempt_code'])
+        self.assertFalse(review.is_attempt_active)
+
+        # check that update_attempt_status has not been called, as the attempt has been archived
+        mock_update_status.assert_not_called()

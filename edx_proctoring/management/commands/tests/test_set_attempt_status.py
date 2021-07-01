@@ -9,11 +9,16 @@ from mock import MagicMock, patch
 
 from django.core.management import call_command
 
-from edx_proctoring.api import create_exam, get_exam_attempt
+from edx_proctoring.api import create_exam, get_current_exam_attempt
 from edx_proctoring.models import ProctoredExamStudentAttempt
 from edx_proctoring.runtime import set_runtime_service
 from edx_proctoring.statuses import ProctoredExamStudentAttemptStatus
-from edx_proctoring.tests.test_services import MockCertificateService, MockCreditService, MockGradesService
+from edx_proctoring.tests.test_services import (
+    MockCertificateService,
+    MockCreditService,
+    MockGradesService,
+    MockInstructorService
+)
 from edx_proctoring.tests.utils import LoggedInTestCase
 
 
@@ -27,10 +32,11 @@ class SetAttemptStatusTests(LoggedInTestCase):
         """
         Build up test data
         """
-        super(SetAttemptStatusTests, self).setUp()
+        super().setUp()
         set_runtime_service('credit', MockCreditService())
         set_runtime_service('grades', MockGradesService())
         set_runtime_service('certificates', MockCertificateService())
+        set_runtime_service('instructor', MockInstructorService())
         self.exam_id = create_exam(
             course_id='foo',
             content_id='bar',
@@ -52,20 +58,19 @@ class SetAttemptStatusTests(LoggedInTestCase):
         Run the management command
         """
 
+        attempt = get_current_exam_attempt(self.exam_id, self.user.id)
         call_command('set_attempt_status',
-                     exam_id=self.exam_id,
-                     user_id=self.user.id,
+                     attempt_id=attempt['id'],
                      to_status=ProctoredExamStudentAttemptStatus.rejected)
 
-        attempt = get_exam_attempt(self.exam_id, self.user.id)
+        attempt = get_current_exam_attempt(self.exam_id, self.user.id)
         self.assertEqual(attempt['status'], ProctoredExamStudentAttemptStatus.rejected)
 
         call_command('set_attempt_status',
-                     exam_id=self.exam_id,
-                     user_id=self.user.id,
+                     attempt_id=attempt['id'],
                      to_status=ProctoredExamStudentAttemptStatus.verified)
 
-        attempt = get_exam_attempt(self.exam_id, self.user.id)
+        attempt = get_current_exam_attempt(self.exam_id, self.user.id)
         self.assertEqual(attempt['status'], ProctoredExamStudentAttemptStatus.verified)
 
     def test_bad_status(self):
@@ -73,8 +78,8 @@ class SetAttemptStatusTests(LoggedInTestCase):
         Try passing a bad status
         """
 
+        attempt = get_current_exam_attempt(self.exam_id, self.user.id)
         with self.assertRaises(Exception):
             call_command('set_attempt_status',
-                         exam_id=self.exam_id,
-                         user_id=self.user.id,
+                         attempt_id=attempt['id'],
                          to_status='bad')

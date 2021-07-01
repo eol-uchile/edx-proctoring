@@ -6,7 +6,7 @@ EOL
     :alt: EolTests
 
 EOL Configuration
--------------
+-----------------
 
 To get the student progress on specific block types, in your lms.yml add the following::
 
@@ -25,9 +25,9 @@ edx-proctoring
     :target: https://pypi.python.org/pypi/edx-proctoring/
     :alt: PyPI
 
-.. image:: https://travis-ci.org/edx/edx-proctoring.svg?branch=master
-    :target: https://travis-ci.org/edx/edx-proctoring
-    :alt: Travis
+.. image:: https://github.com/edx/edx-proctoring/workflows/Python%20CI/badge.svg
+    :target: https://github.com/edx/edx-proctoring/actions?query=workflow%3A%22Python+CI%22
+    :alt: Python CI
 
 .. image:: https://codecov.io/gh/edx/edx-proctoring/branch/master/graph/badge.svg
     :target: https://codecov.io/gh/edx/edx-proctoring

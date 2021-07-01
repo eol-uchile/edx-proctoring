@@ -14,6 +14,33 @@ from django.apps import AppConfig
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 
+BACKEND_CONFIGURATION_ALLOW_LIST = [
+    'base_url',
+    'client_id',
+    'client_secret',
+    'crypto_key',
+    'default_rules',
+    'exam_register_endpoint',
+    'exam_sponsor',
+    'has_dashboard',
+    'help_center_article_url',
+    'integration_specific_email',
+    'learner_notification_from_email',
+    'needs_oauth',
+    'organization',
+    'passing_statuses',
+    'ping_interval',
+    'secret_key',
+    'secret_key_id',
+    'send_email',
+    'software_download_url',
+    'supports_onboarding',
+    'tech_support_email',
+    'tech_support_phone',
+    'token_expiration_time',
+    'verbose_name',
+]
+
 
 def make_worker_config(backends, out='/tmp/workers.json'):
     """
@@ -101,13 +128,14 @@ class EdxProctoringConfig(AppConfig):
         if name is None:
             try:
                 name = settings.PROCTORING_BACKENDS['DEFAULT']
-            except (KeyError, AttributeError):
-                raise ImproperlyConfigured(u"No default proctoring backend set in settings.PROCTORING_BACKENDS")
+            except (KeyError, AttributeError) as exc:
+                raise ImproperlyConfigured(u"No default proctoring backend set in settings.PROCTORING_BACKENDS") \
+                    from exc
         try:
             return self.backends[name]
-        except KeyError:
+        except KeyError as error:
             raise NotImplementedError(u"No proctoring backend configured for '{}'.  "
-                                      u"Available: {}".format(name, list(self.backends)))
+                                      u"Available: {}".format(name, list(self.backends))) from error
 
     def ready(self):
         """
@@ -122,7 +150,10 @@ class EdxProctoringConfig(AppConfig):
         for extension in ExtensionManager(namespace='openedx.proctoring'):
             name = extension.name
             try:
-                options = config[name]
+                options = {
+                    key: val for (key, val) in config[name].items()
+                    if key in BACKEND_CONFIGURATION_ALLOW_LIST
+                }
                 self.backends[name] = extension.plugin(**options)
             except KeyError:
                 pass

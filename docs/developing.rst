@@ -29,7 +29,7 @@ Clone edx-proctoring into the src directory next to edx-platform folder in your 
 
 Install the proctoring package into edx-platform in the container, for both LMS and Studio:
 
-Edit or create the ``edx-platform/requirements/private.txt`` file::
+Edit or create the ``edx-platform/requirements/edx/private.txt`` file::
 
     # edx-platform/requirements/private.txt
     # This file will be used in the docker image, so use file paths that work there.
@@ -47,12 +47,48 @@ In edx-platform/lms/envs/private.py and edx-platform/cms/envs/private.py:
 .. code-block:: python
 
     from .production import FEATURES
-     
+
     FEATURES['ENABLE_SPECIAL_EXAMS'] = True
 
     PROCTORING_SETTINGS = {
         'MUST_BE_VERIFIED_TRACK': False
     }
+
+
+How do I setup `mfe-special-exam-lib` for local development?
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+`MFE special exam lib <https://github.com/edx/frontend-lib-special-exams/>`_ is a react library to support
+special exams in the Learning MFE.
+
+Make sure that `frontend-app-learning` is setup and running on your devstack.
+
+The special exam lib is installed as a dependency of Learning MFE.
+And for the local development module export flow should be overridden, the following steps are required:
+
+* Create new directory `packages` in the `frontend-app-learning` repository and clone special exam library::
+
+    $ cd frontend-app-learning
+    $ mkdir packages
+    $ cd packages
+    $ git clone https://github.com/edx/frontend-lib-special-exams.git
+
+* override module export flow, create `module.config.js` file in the `frontend-app-learning`:
+
+.. code-block::
+
+  // module.config.js
+  module.exports = {
+    localModules: [
+      { moduleName: '@edx/frontend-lib-special-exams', dir: './packages/frontend-lib-special-exams', dist: 'src' },
+    ],
+  };
+
+* restart devstack::
+
+    $ make stop
+    $ make dev.up.lms+frontend-app-learning
+
 
 How does the proctoring system work?
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -65,10 +101,12 @@ Using mockprock as a backend
 `Mockprock <https://github.com/edx/mockprock>`_ is a proctoring backend that runs as an HTTP server and a python module. It allows you to simulate the entire proctoring workflow.
 
 To install it::
+
     $ cd src
     $ git clone git@github.com:edx/mockprock.git
 
 Then add it to your ``private.txt``::
+
     -e /edx/src/mockprock
 
 Add it to your ``private.py``::
@@ -85,6 +123,7 @@ Add it to your ``private.py``::
 Reinstall requirements in lms and studio.
 
 Rebuild static assets to make sure mockprock ui scripts are available::
+
    make lms-static
 
 Then back in your host shell::
@@ -93,16 +132,27 @@ Then back in your host shell::
     pip install -e .[server]
     python -m mockprock.server
 
-If you use Z shell (zsh), the command ``pip install -e .[server]`` will fail with ``zsh: no matches found: .[server]``. This is because `zsh uses square brackets for globbing/pattern matching`_. You should instead run the following command.::
+If you use Z shell (zsh), the command ``pip install -e .[server]`` will fail with ``zsh: no matches found: .[server]``. This is because `zsh uses square brackets for globbing/pattern matching <https://stackoverflow.com/questions/30539798/zsh-no-matches-found-requestssecurity>`_. You should instead run the following command.::
 
    pip install -e ".[server]"
-
-.. _"zsh uses square brackets for globbing/pattern matching": https://stackoverflow.com/questions/30539798/zsh-no-matches-found-requestssecurity
 
 The command will tell you you have to supply an client_id and client_secret. It'll open your browser to the Django admin page where you should create or use an existing credential. You'll also need to add the user associated with the credential to the "mockprock_review" Django group. You can create the group at ``/admin/auth/group/``. Note the client_id and client_secret and restart the server::
 
     python -m mockprock.server {client_id} {client_secret}
 
+If you need to run local changes to the `mockprock Javascript worker`_ or the `worker interface`_ in this library::
+
+   make lms-shell
+
+   (cd /edx/src/mockprock; npm link)
+   npm link @edx/mockprock
+
+   cd /edx/src/mockprock
+   (cd /edx/src/edx-proctoring; npm link)
+   npm link @edx/edx-proctoring
+
+.. _mockprock Javascript worker: https://github.com/edx/mockprock/tree/master/static
+.. _worker interface: https://github.com/edx/edx-proctoring/blob/master/edx_proctoring/static/index.js
 
 How do I run proctoring tests?
 ------------------------------
@@ -131,7 +181,7 @@ Start by following the steps here: https://github.com/edx/edx-proctoring
 * Log in to Django admin
 * Add a verified course mode for your course
 * Update the verified user's mode to be "verified"
-* You will need to fake verifying the user's identification, or else enable a feature to automatically verify users for testing. 
+* You will need to fake verifying the user's identification, or else enable a feature to automatically verify users for testing.
     * To fake the verification:
         * Go to ``/admin/verify_student/manualverification/`` on your sandbox
         * Create a record for the given user, with status "approved".
@@ -181,6 +231,7 @@ Proctortrack
 As will be the case with all REST backends implementing `our spec`_, one
 doesn't need to configure much to get Proctortrack working on a
 sandbox, e.g.::
+
   EDXAPP_PROCTORING_BACKENDS:
     DEFAULT: 'proctortrack'
     proctortrack:
@@ -248,9 +299,16 @@ Release a new version of edx-proctoring
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 * Update the version in ``edx_proctoring/__init__.py`` and ``package.json``
-* Create a `new release on GitHub <https://github.com/edx/edx-proctoring/releases>`_ using the version number 
+* Create a `new release on GitHub <https://github.com/edx/edx-proctoring/releases>`_ using the version number
 * Send an email to release-notifications@edx.org announcing the new version
 * Update edx-platform to use the new version
-    * In edx-platform, create a branch and update the requirements/edx/base.in file to reflect the new tagged branch. 
+    * In edx-platform, create a branch and update the requirements/edx/base.in file to reflect the new tagged branch.
 * create a PR of this branch in edx-platform onto edx-platform:master
 * Once the PR onto edx-platform has been merged, the updated edx-proctoring will be live in production when the normally scheduled release completes.
+
+How do I validate my changes in stage or production?
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+* See `test plan`_ for manual tests and data setup
+
+.. _test plan: ./testing/test_plan.md

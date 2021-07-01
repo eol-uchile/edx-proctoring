@@ -12,7 +12,7 @@ from edx_rest_framework_extensions.auth.jwt.authentication import JwtAuthenticat
 from edx_when import api as when_api
 from eventtracking import tracker
 from opaque_keys import InvalidKeyError
-from opaque_keys.edx.keys import CourseKey
+from opaque_keys.edx.keys import CourseKey, UsageKey
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
@@ -45,6 +45,7 @@ def get_time_remaining_for_attempt(attempt):
 
     # need to adjust for allowances
     expires_at = attempt['started_at'] + timedelta(minutes=attempt['allowed_time_limit_mins'])
+
     now_utc = datetime.now(pytz.UTC)
 
     if expires_at > now_utc:
@@ -114,7 +115,7 @@ def locate_attempt_by_attempt_code(attempt_code):
         if not attempt_obj:
             # still can't find, error out
             err_msg = (
-                u'Could not locate attempt_code: {attempt_code}'.format(attempt_code=attempt_code)
+                'Could not locate attempt_code={attempt_code}'.format(attempt_code=attempt_code)
             )
             log.error(err_msg)
             is_archived = None
@@ -221,7 +222,7 @@ def obscured_user_id(user_id, *extra):
     Obscures the user id, returning a sha1 hash
     Any extra information can be added to the hash
     """
-    obs_hash = hmac.new(settings.SECRET_KEY.encode('ascii'), digestmod=hashlib.sha1)
+    obs_hash = hmac.new(settings.PROCTORING_USER_OBFUSCATION_KEY.encode('ascii'), digestmod=hashlib.sha1)
     obs_hash.update(str(user_id).encode('utf-8'))
     obs_hash.update(b''.join(str(ext).encode('utf-8') for ext in extra))
     return obs_hash.hexdigest()
@@ -281,3 +282,50 @@ def is_reattempting_exam(from_status, to_status):
         ProctoredExamStudentAttemptStatus.is_in_progress_status(from_status) and
         ProctoredExamStudentAttemptStatus.is_pre_started_status(to_status)
     )
+
+
+def get_visibility_check_date(course_schedule, usage_key):
+    """
+    Utility function to return the date, of which
+    we should use to test the learner's visibility to the exam
+
+    Returns one of the following:
+        * The due date of the course structure usage_key
+        * The course end date
+        * The max datetime if no course_end date specified
+    """
+    visibility_check_date = course_schedule.course_end or pytz.utc.localize(datetime.max)
+    exam_schedule_item = course_schedule.sequences.get(usage_key)
+    if exam_schedule_item and exam_schedule_item.due:
+        visibility_check_date = exam_schedule_item.due
+
+    return visibility_check_date
+
+
+def get_exam_type(exam, provider):
+    """ Helper that returns exam type and humanized name by backend provider and exam params. """
+    is_practice_exam = exam['is_proctored'] and exam['is_practice_exam']
+    is_timed_exam = not exam['is_proctored'] and not exam['is_practice_exam']
+
+    exam_type, humanized_type = 'proctored', _('a proctored exam')
+
+    if is_timed_exam:
+        exam_type, humanized_type = 'timed', _('a timed exam')
+    elif is_practice_exam:
+        if provider and provider.supports_onboarding:
+            exam_type, humanized_type = 'onboarding', _('an onboarding exam')
+        else:
+            exam_type, humanized_type = 'practice', _('a practice exam')
+
+    return {
+        'type': exam_type,
+        'humanized_type': humanized_type,
+    }
+
+
+def resolve_exam_url_for_learning_mfe(course_id, content_id):
+    """ Helper that builds the url to the exam for the MFE app learning. """
+    course_key = CourseKey.from_string(course_id)
+    usage_key = UsageKey.from_string(content_id)
+    url = '{}/course/{}/{}'.format(settings.LEARNING_MICROFRONTEND_URL, course_key, usage_key)
+    return url

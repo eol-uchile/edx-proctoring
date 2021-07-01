@@ -6,6 +6,7 @@ All tests for the api.py
 """
 
 import itertools
+import json
 from datetime import datetime, timedelta
 
 import ddt
@@ -13,20 +14,31 @@ import pytz
 from freezegun import freeze_time
 from mock import MagicMock, patch
 
+from django.test.utils import override_settings
+from django.urls import reverse
+
 from edx_proctoring.api import (
     add_allowance_for_user,
-    get_exam_attempt,
+    get_current_exam_attempt,
+    get_exam_attempt_by_id,
     get_exam_by_id,
     get_student_view,
     update_attempt_status,
     update_exam
 )
+from edx_proctoring.constants import DEFAULT_DESKTOP_APPLICATION_PING_INTERVAL_SECONDS
 from edx_proctoring.models import ProctoredExam, ProctoredExamStudentAllowance, ProctoredExamStudentAttempt
 from edx_proctoring.runtime import set_runtime_service
 from edx_proctoring.statuses import ProctoredExamStudentAttemptStatus
 from edx_proctoring.tests import mock_perm
+from edx_proctoring.utils import humanized_time
 
-from .test_services import MockCreditServiceNone, MockCreditServiceWithCourseEndDate
+from .test_services import (
+    MockCreditService,
+    MockCreditServiceNone,
+    MockCreditServiceWithCourseEndDate,
+    MockInstructorService
+)
 from .utils import ProctoredExamTestCase
 
 
@@ -41,7 +53,12 @@ class ProctoredExamStudentViewTests(ProctoredExamTestCase):
         """
         Build out test harnessing
         """
-        super(ProctoredExamStudentViewTests, self).setUp()
+        super().setUp()
+        self.proctored_exam_id = self._create_proctored_exam()
+        self.timed_exam_id = self._create_timed_exam()
+        self.practice_exam_id = self._create_practice_exam()
+        self.onboarding_exam_id = self._create_onboarding_exam()
+        self.disabled_exam_id = self._create_disabled_exam()
 
         # Messages for get_student_view
         self.start_an_exam_msg = 'This exam is proctored'
@@ -52,11 +69,12 @@ class ProctoredExamStudentViewTests(ProctoredExamTestCase):
         self.timed_exam_submitted_expired = 'The time allotted for this exam has expired. Your exam has been submitted'
         self.submitted_timed_exam_msg_with_due_date = 'After the due date has passed,'
         self.exam_time_expired_msg = 'You did not complete the exam in the allotted time'
-        self.exam_time_error_msg = 'A technical error has occurred with your proctored exam'
+        self.exam_time_error_msg = 'A system error has occurred with your proctored exam'
         self.chose_proctored_exam_msg = 'Set up and start your proctored exam'
         self.proctored_exam_optout_msg = 'Take this exam without proctoring'
         self.proctored_exam_completed_msg = 'Are you sure you want to end your proctored exam'
         self.proctored_exam_submitted_msg = 'You have submitted this proctored exam for review'
+        self.proctored_exam_ready_to_resume_msg = 'Your exam is ready to be resumed.'
         self.take_exam_without_proctoring_msg = 'Take this exam without proctoring'
         self.ready_to_start_msg = 'Important'
         self.wrong_browser_msg = 'The content of this exam can only be viewed'
@@ -64,6 +82,7 @@ class ProctoredExamStudentViewTests(ProctoredExamTestCase):
         self.timed_footer_msg = 'Can I request additional time to complete my exam?'
         self.wait_deadline_msg = "The result will be visible after"
         self.inactive_account_msg = "You have not activated your account"
+        self.review_exam_msg = "To view your exam questions and responses"
 
     def _render_exam(self, content_id, context_overrides=None):
         """
@@ -82,6 +101,7 @@ class ProctoredExamStudentViewTests(ProctoredExamTestCase):
             },
             'verification_status': 'approved',
             'verification_url': '/reverify',
+            'is_integrity_signature_enabled': False,
         }
         if context_overrides:
             context.update(context_overrides)
@@ -185,6 +205,18 @@ class ProctoredExamStudentViewTests(ProctoredExamTestCase):
         })
         self.assertIn(expected_message, rendered_response)
 
+    def test_integrity_signature_enabled(self):
+        """
+        This test asserts that the ID verification message is not shown if the
+        integrity signature feature is enabled.
+        """
+        self._create_unstarted_exam_attempt()
+        rendered_response = self.render_proctored_exam({
+            'verification_status': None,
+            'is_integrity_signature_enabled': True,
+        })
+        self.assertIn(self.chose_proctored_exam_msg, rendered_response)
+
     def test_proctored_only_entrance(self):
         """
         This test verifies that learners are not given the option to take
@@ -269,7 +301,7 @@ class ProctoredExamStudentViewTests(ProctoredExamTestCase):
 
         if req_status == 'declined' and not expected_content:
             # also we should have auto-declined if a pre-requisite was declined
-            attempt = get_exam_attempt(self.proctored_exam_id, self.user_id)
+            attempt = get_current_exam_attempt(self.proctored_exam_id, self.user_id)
             self.assertIsNotNone(attempt)
             self.assertEqual(attempt['status'], ProctoredExamStudentAttemptStatus.declined)
 
@@ -400,13 +432,25 @@ class ProctoredExamStudentViewTests(ProctoredExamTestCase):
         )
         self.assertIsNotNone(rendered_response)
 
+    def test_proctoring_instruction_without_software_download_link(self):
+        """
+        Test for get_student_view proctored exam without software download link.
+
+        Other providers could have no onboarding step requires software download
+        Redundant `Start System Check` button is absent in that case.
+        """
+
+        self._create_unstarted_exam_attempt()
+        rendered_response = self.render_proctored_exam()
+        self.assertNotIn('id="software_download_link"', rendered_response)
+
     @ddt.data(False, True)
     def test_get_studentview_unstarted_exam(self, allow_proctoring_opt_out):
         """
         Test for get_student_view proctored exam which has not started yet.
         """
 
-        self._create_unstarted_exam_attempt()
+        attempt = self._create_unstarted_exam_attempt()
 
         # Verify that the option to skip proctoring is shown if allowed
         rendered_response = self.render_proctored_exam({
@@ -421,8 +465,7 @@ class ProctoredExamStudentViewTests(ProctoredExamTestCase):
         # Now make sure content remains the same if the status transitions
         # to 'download_software_clicked'.
         update_attempt_status(
-            self.proctored_exam_id,
-            self.user_id,
+            attempt.id,
             ProctoredExamStudentAttemptStatus.download_software_clicked
         )
         rendered_response = self.render_proctored_exam()
@@ -641,6 +684,7 @@ class ProctoredExamStudentViewTests(ProctoredExamTestCase):
         else:
             self.assertNotIn(self.wait_deadline_msg, rendered_response)
 
+    @patch("edx_proctoring.api.constants.CONTENT_VIEWABLE_PAST_DUE_DATE", True)
     def test_get_studentview_acknowledged_proctored_exam_with_grace_period(self):
         """
         Verify the student view for an acknowledge proctored exam with an active
@@ -693,7 +737,11 @@ class ProctoredExamStudentViewTests(ProctoredExamTestCase):
         )
         self.assertIn(self.wait_deadline_msg, rendered_response)
 
-    def test_proctored_exam_attempt_with_past_due_datetime(self):
+    @ddt.data(
+        False,
+        True,
+    )
+    def test_proctored_exam_attempt_with_past_due_datetime(self, is_onboarding_exam):
         """
         Test for get_student_view for proctored exam with past due datetime
         """
@@ -701,7 +749,7 @@ class ProctoredExamStudentViewTests(ProctoredExamTestCase):
         due_date = datetime.now(pytz.UTC) + timedelta(days=1)
 
         # exam is created with due datetime which has already passed
-        self._create_exam_with_due_time(due_date=due_date)
+        self._create_exam_with_due_time(due_date=due_date, is_practice_exam=is_onboarding_exam)
 
         # due_date is exactly after 24 hours, if student arrives after 2 days
         # then he can not attempt the proctored exam
@@ -728,7 +776,7 @@ class ProctoredExamStudentViewTests(ProctoredExamTestCase):
                 content_id=self.content_id_for_exam_with_due_date,
                 context={
                     'is_proctored': True,
-                    'is_practice_exam': True,
+                    'is_practice_exam': is_onboarding_exam,
                     'display_name': self.exam_name,
                     'default_time_limit_mins': self.default_time_limit,
                     'due_date': due_date,
@@ -810,66 +858,184 @@ class ProctoredExamStudentViewTests(ProctoredExamTestCase):
         # now make sure if this status transitions to 'second_review_required'
         # the student will still see a 'submitted' message
         update_attempt_status(
-            exam_attempt.proctored_exam_id,
-            exam_attempt.user_id,
+            exam_attempt.id,
             ProctoredExamStudentAttemptStatus.second_review_required
         )
         rendered_response = self.render_proctored_exam()
         self.assertIn(self.proctored_exam_submitted_msg, rendered_response)
 
-    def test_get_studentview_submitted_status_with_duedate(self):
+    @override_settings(PROCTORED_EXAM_VIEWABLE_PAST_DUE=False)
+    @ddt.data(
+        (ProctoredExamStudentAttemptStatus.submitted, True),
+        (ProctoredExamStudentAttemptStatus.submitted, False),
+        (ProctoredExamStudentAttemptStatus.second_review_required, True),
+        (ProctoredExamStudentAttemptStatus.second_review_required, False),
+        (ProctoredExamStudentAttemptStatus.rejected, True),
+        (ProctoredExamStudentAttemptStatus.rejected, False),
+        (ProctoredExamStudentAttemptStatus.verified, True),
+        (ProctoredExamStudentAttemptStatus.verified, False)
+    )
+    @ddt.unpack
+    def test_get_studentview_without_viewable_content(self, status, status_acknowledged):
         """
         Test for get_student_view proctored exam which has been submitted
-        And due date has passed
+        but exam content is not viewable if the due date has passed
         """
-        proctored_exam = ProctoredExam.objects.create(
-            course_id='a/b/c',
-            content_id='test_content',
-            exam_name='Test Exam',
-            external_id='123aXqe3',
-            time_limit_mins=30,
-            is_proctored=True,
-            is_active=True,
-            due_date=datetime.now(pytz.UTC) + timedelta(minutes=40)
+        due_date = datetime.now(pytz.UTC) + timedelta(minutes=40)
+        exam_id = self._create_exam_with_due_time(
+            is_proctored=True, due_date=due_date
         )
 
         exam_attempt = ProctoredExamStudentAttempt.objects.create(
-            proctored_exam=proctored_exam,
+            proctored_exam_id=exam_id,
             user=self.user,
             allowed_time_limit_mins=30,
             taking_as_proctored=True,
-            external_id=proctored_exam.external_id,
+            external_id='fdage332',
+            status=status,
+        )
+
+        exam_attempt.is_status_acknowledged = status_acknowledged
+        exam_attempt.save()
+
+        # due date is after 10 minutes
+        reset_time = datetime.now(pytz.UTC) + timedelta(minutes=60)
+        with freeze_time(reset_time):
+            rendered_response = get_student_view(
+                user_id=self.user.id,
+                course_id=self.course_id,
+                content_id=self.content_id_for_exam_with_due_date,
+                context={
+                    'is_proctored': True,
+                    'display_name': 'Test Exam',
+                    'default_time_limit_mins': 30,
+                    'due_date': due_date
+                }
+            )
+            self.assertIsNotNone(rendered_response)
+            self.assertNotIn(self.review_exam_msg, rendered_response)
+
+    @patch("edx_proctoring.api.constants.CONTENT_VIEWABLE_PAST_DUE_DATE", True)
+    @ddt.data(
+        60,
+        20,
+    )
+    def test_get_studentview_submitted_status_with_duedate_status_acknowledged(self, reset_time_delta):
+        """
+        Test for get_student_view proctored exam which has been submitted
+        And status acknowledged
+        The test sets up a proctored exam with due date.
+        The test would check, before the due date passed, if is_status_acknowledged is true on the attempt,
+        the exam interstial still shows. This means the learner cannot see exam content
+        The test also checks, after the due date passed, if is_status_acknowledged is true on the attempt,
+        the exam interstial is no longer blocking the exam content
+        """
+        due_date_delta = 40
+        due_date = datetime.now(pytz.UTC) + timedelta(minutes=due_date_delta)
+        due_date_passed = reset_time_delta > due_date_delta
+        exam_id = self._create_exam_with_due_time(
+            is_proctored=True, due_date=due_date
+        )
+
+        exam_attempt = ProctoredExamStudentAttempt.objects.create(
+            proctored_exam_id=exam_id,
+            user=self.user,
+            allowed_time_limit_mins=30,
+            taking_as_proctored=True,
+            external_id='fdage332',
             status=ProctoredExamStudentAttemptStatus.submitted,
         )
 
         # due date is after 10 minutes
-        reset_time = datetime.now(pytz.UTC) + timedelta(minutes=20)
+        reset_time = datetime.now(pytz.UTC) + timedelta(minutes=reset_time_delta)
         with freeze_time(reset_time):
             rendered_response = get_student_view(
                 user_id=self.user.id,
-                course_id='a/b/c',
-                content_id='test_content',
+                course_id=self.course_id,
+                content_id=self.content_id_for_exam_with_due_date,
                 context={
                     'is_proctored': True,
                     'display_name': 'Test Exam',
-                    'default_time_limit_mins': 30
+                    'default_time_limit_mins': 30,
+                    'due_date': due_date
                 }
             )
             self.assertIn(self.proctored_exam_submitted_msg, rendered_response)
+            if due_date_passed:
+                self.assertIn(self.review_exam_msg, rendered_response)
+
             exam_attempt.is_status_acknowledged = True
             exam_attempt.save()
 
             rendered_response = get_student_view(
                 user_id=self.user.id,
-                course_id='a/b/c',
-                content_id='test_content',
+                course_id=self.course_id,
+                content_id=self.content_id_for_exam_with_due_date,
                 context={
                     'is_proctored': True,
                     'display_name': 'Test Exam',
-                    'default_time_limit_mins': 30
+                    'default_time_limit_mins': 30,
+                    'due_date': due_date
+                }
+            )
+            if due_date_passed:
+                self.assertIsNone(rendered_response)
+            else:
+                self.assertIsNotNone(rendered_response)
+
+    @patch("edx_proctoring.api.constants.CONTENT_VIEWABLE_PAST_DUE_DATE", True)
+    @patch('edx_when.api.get_date_for_block')
+    def test_get_studentview_submitted_personalize_scheduled_duedate_status_acknowledged(self, get_date_for_block_mock):
+        """
+        Test for get_student_view proctored exam which has been submitted
+        And status acknowledged. However, this time, the due date is controlled by personalize schedule on
+        self-paced course.
+        The test sets up a proctored exam, also mocks the edx_when api to return personalized due dates.
+        The test would check, after the personalized due date passed, if is_status_acknowledged is true on the attempt,
+        the exam interstial is no longer blocking the exam content
+        """
+        due_date_delta = 40
+        due_date = datetime.now(pytz.UTC) + timedelta(minutes=due_date_delta)
+        get_date_for_block_mock.return_value = due_date
+
+        exam_attempt = ProctoredExamStudentAttempt.objects.create(
+            proctored_exam_id=self.proctored_exam_id,
+            user=self.user,
+            allowed_time_limit_mins=30,
+            taking_as_proctored=True,
+            external_id='fdage332',
+            status=ProctoredExamStudentAttemptStatus.submitted,
+        )
+
+        reset_time = datetime.now(pytz.UTC) + timedelta(minutes=60)
+        with freeze_time(reset_time):
+            rendered_response = get_student_view(
+                user_id=self.user.id,
+                course_id=self.course_id,
+                content_id=self.content_id,
+                context={
+                    'is_proctored': True,
+                    'display_name': self.exam_name,
+                    'default_time_limit_mins': 30,
+                    'due_date': due_date
                 }
             )
             self.assertIsNotNone(rendered_response)
+            exam_attempt.is_status_acknowledged = True
+            exam_attempt.save()
+
+            rendered_response = get_student_view(
+                user_id=self.user.id,
+                course_id=self.course_id,
+                content_id=self.content_id,
+                context={
+                    'is_proctored': True,
+                    'display_name': self.exam_name,
+                    'default_time_limit_mins': 30,
+                    'due_date': due_date
+                }
+            )
+            self.assertIsNone(rendered_response)
 
     @ddt.data(
         *itertools.product(
@@ -963,16 +1129,6 @@ class ProctoredExamStudentViewTests(ProctoredExamTestCase):
             else:
                 self.assertIn(self.exam_expired_msg, rendered_response)
 
-    def test_get_no_perm_view(self):
-        """
-        Test for get_student_view prompting when the student does not have permission
-        to view proctored exams, this should return None
-        (For edx-proctoring tests, only authenticated students have the permission)
-        """
-        with mock_perm('edx_proctoring.can_take_proctored_exam'):
-            rendered_response = self.render_proctored_exam()
-        self.assertIsNone(rendered_response)
-
     def test_get_studentview_started_onboarding(self):
         """
         Test fallthrough page case for onboarding exams
@@ -990,12 +1146,19 @@ class ProctoredExamStudentViewTests(ProctoredExamTestCase):
         rendered_response = self.render_onboarding_exam()
         self.assertIn('Proctoring onboarding exam', rendered_response)
 
-    def test_get_onboarding_no_perm(self):
+    @ddt.data(
+        render_proctored_exam,
+        render_practice_exam,
+        render_onboarding_exam
+    )
+    def test_get_exam_view_no_perm(self, render_exam):
         """
-        Test that onboarding exams are gated by the same permission as proctored exams
+        Test for get_student_view prompting when the student does not have permission
+        to view proctored exams, this should return None
+        (For edx-proctoring tests, only authenticated students have the permission)
         """
         with mock_perm('edx_proctoring.can_take_proctored_exam'):
-            rendered_response = self.render_onboarding_exam()
+            rendered_response = render_exam(self)
         self.assertIsNone(rendered_response)
 
     @ddt.data(
@@ -1293,3 +1456,129 @@ class ProctoredExamStudentViewTests(ProctoredExamTestCase):
 
         rendered_response = render_exam(self)
         self.assertIn(self.inactive_account_msg, rendered_response)
+
+    @ddt.data(
+        (render_onboarding_exam, ProctoredExamStudentAttemptStatus.submitted, True),
+        (render_onboarding_exam, ProctoredExamStudentAttemptStatus.error, True),
+        (render_practice_exam, ProctoredExamStudentAttemptStatus.submitted, False),
+        (render_practice_exam, ProctoredExamStudentAttemptStatus.error, False),
+    )
+    @ddt.unpack
+    def test_reset_on_interstitial(self, render_exam, original_status, is_onboarding):
+        """
+        Test that reset button exists on appropriate interstitials, and that the
+        reset is done correctly
+        """
+        set_runtime_service('credit', MockCreditService())
+        set_runtime_service('instructor', MockInstructorService(is_user_course_staff=True))
+
+        if is_onboarding:
+            exam_attempt = self._create_onboarding_attempt()
+        else:
+            exam_attempt = self._create_started_practice_exam_attempt()
+        exam_attempt.status = original_status
+        exam_attempt.save()
+
+        # check that only one attempt exists in history table
+        active_attempts = ProctoredExamStudentAttempt.objects.filter(status=original_status)
+        self.assertEqual(len(active_attempts), 1)
+
+        # there's not a great way to mock clicking on a button, so we
+        # will check that the button is rendered, and then call the endpoint
+        # that would be hit with a button click. This doesn't differ that much
+        # from the test_reset_attempt_action in test_views.py, other than
+        # that it tests some frontend and backend, and checks for multiple statuses
+        # and exam types
+
+        # check that button exists
+        rendered_response = render_exam(self)
+        self.assertIn('exam-action-button', rendered_response)
+
+        # call url that would be called if button were clicked
+        response = self.client.put(
+            reverse('edx_proctoring:proctored_exam.attempt', args=[exam_attempt.id]),
+            json.dumps({
+                'action': 'reset_attempt',
+            }),
+            content_type='application/json'
+        )
+        self.assertEqual(response.status_code, 200)
+
+        # check that only one new attempt has been created
+        created_attempts = ProctoredExamStudentAttempt.objects.filter(status=ProctoredExamStudentAttemptStatus.created)
+        self.assertEqual(len(created_attempts), 1)
+
+    @ddt.data(
+        (render_proctored_exam, 'proctored'),
+        (render_practice_exam, 'practice'),
+        (render_onboarding_exam, 'onboarding'),
+    )
+    @ddt.unpack
+    def test_get_student_view_ready_to_resume_status(self, render_exam, exam_type):
+        """
+        Test that the ready to resume interstitial is shown to exam attempts in the ready_to_resume_state
+        and test that the time remaining is displayed.
+        """
+        if exam_type == 'proctored':
+            exam_attempt = self._create_started_exam_attempt()
+        elif exam_type == 'practice':
+            exam_attempt = self._create_started_practice_exam_attempt()
+        else:
+            exam_attempt = self._create_started_onboarding_exam_attempt()
+
+        # transition exam to error in order to save time_remaining_seconds
+        error_response = self.client.put(
+            reverse('edx_proctoring:proctored_exam.attempt', args=[exam_attempt.id]),
+            json.dumps({
+                'action': 'error',
+            }),
+            content_type='application/json'
+        )
+        self.assertEqual(error_response.status_code, 200)
+
+        # transition exam to ready_to_resume
+        resume_response = self.client.put(
+            reverse('edx_proctoring:proctored_exam.attempt', args=[exam_attempt.id]),
+            json.dumps({
+                'action': 'mark_ready_to_resume',
+            }),
+            content_type='application/json'
+        )
+        self.assertEqual(resume_response.status_code, 200)
+
+        rendered_response = render_exam(self)
+        self.assertIn(self.proctored_exam_ready_to_resume_msg, rendered_response)
+
+        time_remaining = humanized_time(int(get_exam_attempt_by_id(exam_attempt.id)['time_remaining_seconds'] / 60))
+        time_remaining_string = 'You will have {} to complete your exam.'.format(time_remaining)
+        self.assertIn(time_remaining_string, rendered_response)
+
+    @ddt.data(
+        (render_proctored_exam, 'proctored'),
+        (render_practice_exam, 'practice'),
+        (render_onboarding_exam, 'onboarding'),
+    )
+    @ddt.unpack
+    def test_get_student_view_ping_interval_for_view(self, render_exam, exam_type):
+        """
+        Test that the ping_interval, which is a time period between each ping
+        edX website will do with the proctoring desktop app, is rendering from the
+        server templates
+        """
+        exam_id = self.proctored_exam_id
+        if exam_type == 'practice':
+            exam_id = self.practice_exam_id
+        if exam_type == 'onboarding':
+            exam_id = self.onboarding_exam_id
+
+        self._create_exam_attempt(
+            exam_id,
+            ProctoredExamStudentAttemptStatus.ready_to_start
+        )
+
+        rendered_response = render_exam(self)
+
+        expected_javascript_string = 'edx.courseware.proctored_exam.ProctoringAppPingInterval = {}'.format(
+            DEFAULT_DESKTOP_APPLICATION_PING_INTERVAL_SECONDS
+        )
+        self.assertIn(expected_javascript_string, rendered_response)

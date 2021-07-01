@@ -1,12 +1,14 @@
 """
 Specialized exceptions for the Notification subsystem
 """
+from rest_framework import status
 
 
 class ProctoredBaseException(Exception):
     """
     A common base class for all exceptions
     """
+    http_status = status.HTTP_400_BAD_REQUEST
 
 
 class ProctoredExamAlreadyExists(ProctoredBaseException):
@@ -19,9 +21,6 @@ class ProctoredExamNotFoundException(ProctoredBaseException):
     """
     Raised when a look up fails.
     """
-    def __init__(self, *args):
-        """ Init method of exception """
-        ProctoredBaseException.__init__(self, u'The exam_id does not exist.', *args)
 
 
 class ProctoredExamReviewPolicyNotFoundException(ProctoredBaseException):
@@ -74,7 +73,7 @@ class UserNotFoundException(ProctoredBaseException):
 
 class AllowanceValueNotAllowedException(ProctoredBaseException):
     """
-    Raised when the allowance value is not an non-negative integer
+    Raised when the allowance value is not an non-negative integer or float
     """
 
 
@@ -85,7 +84,7 @@ class BackendProviderCannotRegisterAttempt(ProctoredBaseException):
 
     def __init__(self, content, http_status):
         """ Init method of exception """
-        super(BackendProviderCannotRegisterAttempt, self).__init__(self, content)
+        super().__init__(self, content)
         self.http_status = http_status
 
 
@@ -101,16 +100,26 @@ class BackendProviderOnboardingException(ProctoredBaseException):
     Raised when a back-end provider cannot register an attempt
     because of missing/failed onboarding requirements
     """
-    def __init__(self, status):
+    def __init__(self, exam_status):
         """ Init method of exception """
-        super(BackendProviderOnboardingException, self).__init__(self, status)
-        self.status = status
+        super().__init__(self, exam_status)
+        self.status = exam_status
+
+
+class BackendProviderOnboardingProfilesException(ProctoredBaseException):
+    """
+    Raised when a backend provider cannot get the requested onboarding profiles
+    """
+    def __init__(self, content, http_status):
+        super().__init__(self, content)
+        self.http_status = http_status
 
 
 class ProctoredExamPermissionDenied(ProctoredBaseException):
     """
     Raised when the calling user does not have access to the requested object.
     """
+    http_status = status.HTTP_403_FORBIDDEN
 
 
 class ProctoredExamSuspiciousLookup(ProctoredBaseException):
@@ -143,3 +152,10 @@ class BackendProviderCannotRetireUser(ProctoredBaseException):
     """
     Raised when a back-end provider cannot retire a user
     """
+
+
+class BackendProviderNotConfigured(ProctoredBaseException):
+    """
+    Raised when a back-end provider not configured.
+    """
+    http_status = status.HTTP_500_INTERNAL_SERVER_ERROR

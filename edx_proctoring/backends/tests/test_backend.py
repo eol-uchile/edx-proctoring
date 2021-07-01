@@ -108,6 +108,12 @@ class TestBackendProvider(ProctoringBackendProvider):
         self.last_retire_user = user_id
         return True
 
+    def get_proctoring_config(self):
+        """
+        Returns the faked metadata and configuration options for the proctoring service.
+        """
+        return {'name': self.verbose_name}
+
 
 class PassthroughBackendProvider(ProctoringBackendProvider):
     """
@@ -118,7 +124,7 @@ class PassthroughBackendProvider(ProctoringBackendProvider):
         """
         Called when the exam attempt has been created but not started
         """
-        return super(PassthroughBackendProvider, self).register_exam_attempt(
+        return super().register_exam_attempt(
             exam,
             context
         )
@@ -128,7 +134,7 @@ class PassthroughBackendProvider(ProctoringBackendProvider):
         Method that is responsible for communicating with the backend provider
         to establish a new proctored exam
         """
-        return super(PassthroughBackendProvider, self).start_exam_attempt(
+        return super().start_exam_attempt(
             exam,
             attempt
         )
@@ -138,7 +144,7 @@ class PassthroughBackendProvider(ProctoringBackendProvider):
         Method that is responsible for communicating with the backend provider
         to establish a new proctored exam
         """
-        return super(PassthroughBackendProvider, self).stop_exam_attempt(
+        return super().stop_exam_attempt(
             exam,
             attempt
         )
@@ -149,13 +155,13 @@ class PassthroughBackendProvider(ProctoringBackendProvider):
         backend provider to mark a proctored session as having
         encountered a technical error
         """
-        return super(PassthroughBackendProvider, self).mark_erroneous_exam_attempt(
+        return super().mark_erroneous_exam_attempt(
             exam,
             attempt
         )
 
     def remove_exam_attempt(self, exam, attempt):
-        return super(PassthroughBackendProvider, self).remove_exam_attempt(
+        return super().remove_exam_attempt(
             exam,
             attempt
         )
@@ -165,16 +171,19 @@ class PassthroughBackendProvider(ProctoringBackendProvider):
         Returns the URL that the user needs to go to in order to download
         the corresponding desktop software
         """
-        return super(PassthroughBackendProvider, self).get_software_download_url()
+        return super().get_software_download_url()
 
     def on_review_callback(self, attempt, payload):
         """
         Called when the reviewing 3rd party service posts back the results
         """
-        return super(PassthroughBackendProvider, self).on_review_callback(attempt, payload)
+        return super().on_review_callback(attempt, payload)
 
     def on_exam_saved(self, exam):
-        return super(PassthroughBackendProvider, self).on_exam_saved(exam)
+        return super().on_exam_saved(exam)
+
+    def get_onboarding_profile_info(self, course_id, **kwargs):
+        return super().get_onboarding_profile_info(course_id, **kwargs)
 
 
 class TestBackends(TestCase):
@@ -214,6 +223,8 @@ class TestBackends(TestCase):
             provider.on_exam_saved(None)
 
         self.assertIsNone(provider.get_exam(None))
+
+        self.assertIsNone(provider.get_onboarding_profile_info(course_id='test'))
 
     def test_null_provider(self):
         """
@@ -255,6 +266,31 @@ class TestBackends(TestCase):
         self.assertIsNone(provider.mark_erroneous_exam_attempt(None, None))
         self.assertIsNone(provider.on_review_callback(None, None))
         self.assertIsNone(provider.on_exam_saved(None))
+
+    @patch('logging.Logger.exception')
+    @patch('edx_proctoring.callbacks.get_exam_attempt_by_code')
+    @patch('edx_proctoring.callbacks.update_attempt_status')
+    def test_mock_provider_exception(self, _, get_attempt_mock, logger_mock):
+        """
+        Test that the mock backend provider logs exception
+        """
+        provider = MockProctoringBackendProvider()
+
+        attempt_code = 'test_code'
+
+        get_attempt_mock.return_value = {
+            'status': 'submitted',
+            'attempt_code': attempt_code,
+            'id': 1,
+            'proctored_exam': {'course_id': '', 'content_id': ''}
+        }
+        provider.register_exam_attempt(None, {'attempt_code': attempt_code})
+        time.sleep(2)
+
+        self.assertTrue(get_attempt_mock.called)
+
+        log_format_string = ("BLOCKING ERROR: Can't find course info url for course_id=%s")
+        logger_mock.assert_any_call(log_format_string, '')
 
 
 class BackendChooserTests(TestCase):

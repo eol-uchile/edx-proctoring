@@ -2,11 +2,12 @@
 
 import logging
 
-from django.db.models.signals import post_save, pre_delete, pre_save
+from django.db.models.signals import post_delete, post_save, pre_delete, pre_save
 from django.dispatch import receiver
 
 from edx_proctoring import api, constants, models
 from edx_proctoring.backends import get_backend_provider
+from edx_proctoring.runtime import get_runtime_service
 from edx_proctoring.statuses import ProctoredExamStudentAttemptStatus, SoftwareSecureReviewStatus
 from edx_proctoring.utils import emit_event, locate_attempt_by_attempt_code
 
@@ -105,6 +106,18 @@ def on_attempt_changed(sender, instance, signal, **kwargs):  # pylint: disable=u
             # to archive it
             original = sender.objects.get(id=instance.id)
 
+            # if the exam was finished for the first time, we want to mark it as
+            # complete in the Completion Service.
+            # This functionality was added because regardless of submission status
+            # on individual problems, we want to mark the entire exam as complete
+            # when the exam is finished since there are no more actions a learner can take.
+            if not original.completed_at and instance.completed_at:
+                instructor_service = get_runtime_service('instructor')
+                if instructor_service:
+                    username = instance.user.username
+                    content_id = instance.proctored_exam.content_id
+                    instructor_service.complete_student_attempt(username, content_id)
+
             if original.status != instance.status:
                 instance = original
             else:
@@ -118,8 +131,28 @@ def on_attempt_changed(sender, instance, signal, **kwargs):  # pylint: disable=u
         if backend:
             result = backend.remove_exam_attempt(instance.proctored_exam.external_id, instance.external_id)
             if not result:
-                log.error(u'Failed to remove attempt %d from %s', instance.id, backend.verbose_name)
+                log.error(
+                    'Failed to remove attempt_id=%s from backend=%s',
+                    instance.id,
+                    instance.proctored_exam.backend,
+                )
     models.archive_model(models.ProctoredExamStudentAttemptHistory, instance, id='attempt_id')
+
+
+@receiver(post_delete, sender=models.ProctoredExamStudentAttempt)
+def finish_attempt_flow(sender, instance, signal, **kwargs):  # pylint: disable=unused-argument
+    """
+    After an attempt has been archived, update the associated review if needed
+    """
+    # check to see if there is a review that should be updated
+    # should be fine to use instance here, as we are not looking for the exact object in a db
+    current_review = models.ProctoredExamSoftwareSecureReview.get_review_by_attempt_code(
+        attempt_code=instance.attempt_code
+    )
+    if current_review:
+        # update field to note that attempt is no longer active
+        current_review.is_attempt_active = False
+        current_review.save()
 
 
 # Hook up the signals to record updates/deletions in the ProctoredExamSoftwareSecureReview table.
@@ -173,8 +206,7 @@ def finish_review_workflow(sender, instance, signal, **kwargs):  # pylint: disab
         # (i.e. updating credit eligibility table)
         # archived attempts should not trigger the workflow
         api.update_attempt_status(
-            attempt['proctored_exam']['id'],
-            attempt['user']['id'],
+            attempt['id'],
             attempt_status,
             raise_if_not_found=False,
             update_attributable_to=review.reviewed_by or None

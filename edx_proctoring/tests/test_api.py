@@ -4,7 +4,6 @@
 """
 All tests for the api.py
 """
-
 from datetime import datetime, timedelta
 from itertools import product
 
@@ -13,12 +12,19 @@ import pytz
 from freezegun import freeze_time
 from mock import MagicMock, patch
 
+from django.conf import settings
+from django.core import mail
+from django.test.utils import override_settings
+from django.urls import reverse
+
 from edx_proctoring.api import (
     _are_prerequirements_satisfied,
     _check_for_attempt_timeout,
     _get_ordered_prerequisites,
     _get_review_policy_by_exam_id,
     add_allowance_for_user,
+    add_bulk_allowances,
+    check_prerequisites,
     create_exam,
     create_exam_attempt,
     create_exam_review_policy,
@@ -29,8 +35,10 @@ from edx_proctoring.api import (
     get_allowances_for_course,
     get_attempt_status_summary,
     get_backend_provider,
-    get_exam_attempt,
+    get_current_exam_attempt,
+    get_enrollments_can_take_proctored_exams,
     get_exam_attempt_by_id,
+    get_exam_attempt_data,
     get_exam_by_content_id,
     get_exam_by_id,
     get_exam_configuration_dashboard_url,
@@ -38,13 +46,16 @@ from edx_proctoring.api import (
     get_filtered_exam_attempts,
     get_integration_specific_email,
     get_last_exam_completion_date,
+    get_last_verified_onboarding_attempts_per_user,
     get_review_policy_by_exam_id,
+    get_user_attempts_by_exam_id,
     is_backend_dashboard_available,
     mark_exam_attempt_as_ready,
     mark_exam_attempt_timeout,
     remove_allowance_for_user,
     remove_exam_attempt,
     remove_review_policy,
+    reset_practice_exam,
     start_exam_attempt,
     start_exam_attempt_by_code,
     stop_exam_attempt,
@@ -53,7 +64,8 @@ from edx_proctoring.api import (
     update_exam_attempt,
     update_review_policy
 )
-from edx_proctoring.constants import DEFAULT_CONTACT_EMAIL
+from edx_proctoring.backends.tests.test_backend import TestBackendProvider
+from edx_proctoring.constants import ADDITIONAL_TIME, DEFAULT_CONTACT_EMAIL, TIME_MULTIPLIER
 from edx_proctoring.exceptions import (
     AllowanceValueNotAllowedException,
     BackendProviderSentNoAttemptID,
@@ -87,7 +99,9 @@ from .test_services import (
     MockCreditService,
     MockCreditServiceNone,
     MockCreditServiceWithCourseEndDate,
-    MockGradesService
+    MockEnrollmentsService,
+    MockGradesService,
+    MockInstructorService
 )
 from .utils import ProctoredExamTestCase
 
@@ -103,15 +117,22 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
         """
         Initialize
         """
-        super(ProctoredExamApiTests, self).setUp()
+        super().setUp()
+        self.proctored_exam_id = self._create_proctored_exam()
+        self.timed_exam_id = self._create_timed_exam()
+        self.practice_exam_id = self._create_practice_exam()
+        self.onboarding_exam_id = self._create_onboarding_exam()
+        self.disabled_exam_id = self._create_disabled_exam()
         set_runtime_service('certificates', MockCertificateService())
+        set_runtime_service('instructor', MockInstructorService())
 
     def tearDown(self):
         """
         When tests are done
         """
-        super(ProctoredExamApiTests, self).tearDown()
+        super().tearDown()
         set_runtime_service('certificates', None)
+        set_runtime_service('instructor', None)
 
     def _add_allowance_for_user(self):
         """
@@ -145,7 +166,7 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
 
         self.assertEqual(update_practice_exam.time_limit_mins, 31)
         self.assertEqual(update_practice_exam.course_id, self.course_id)
-        self.assertEqual(update_practice_exam.content_id, 'test_content_id_practice')
+        self.assertEqual(update_practice_exam.content_id, 'block-v1:test+course+1+type@sequential+block@practice')
         self.assertEqual(update_practice_exam.backend, 'null')
 
     def test_update_proctored_exam(self):
@@ -167,7 +188,7 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
         self.assertEqual(update_proctored_exam.exam_name, 'Updated Exam Name')
         self.assertEqual(update_proctored_exam.time_limit_mins, 30)
         self.assertEqual(update_proctored_exam.course_id, self.course_id)
-        self.assertEqual(update_proctored_exam.content_id, 'test_content_id')
+        self.assertEqual(update_proctored_exam.content_id, 'block-v1:test+course+1+type@sequential+block@exam')
 
     def test_update_timed_exam(self):
         """
@@ -479,6 +500,356 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
         remove_allowance_for_user(student_allowance.proctored_exam.id, self.user_id, self.key)
         self.assertEqual(len(ProctoredExamStudentAllowance.objects.filter()), 0)
 
+    @ddt.data(
+        (
+            ADDITIONAL_TIME,
+            '30',
+            '30',
+            '30'
+        ),
+        (
+            TIME_MULTIPLIER,
+            '1.5',
+            '10',
+            '45'
+        )
+    )
+    @ddt.unpack
+    def test_add_bulk_allowance(self, allowance_type, value, exam1_allowance, exam2_allowance):
+        """
+        Add bulk allowance with valid data
+        """
+        user_list = self.create_batch_users(3)
+        exam_list = []
+        exam_list.extend(
+            (create_exam(
+                        course_id=self.course_id,
+                        content_id="1st exam",
+                        exam_name="1st exam",
+                        time_limit_mins=self.default_time_limit,
+                        is_practice_exam=False,
+                        is_proctored=True
+            ),
+             create_exam(
+                    course_id=self.course_id,
+                    content_id="2nd exam",
+                    exam_name="2nd exam",
+                    time_limit_mins=90,
+                    is_practice_exam=False,
+                    is_proctored=True
+            ))
+        )
+        _, successes, failures = add_bulk_allowances(exam_list, user_list, allowance_type, value)
+        student_allowance = ProctoredExamStudentAllowance.get_allowance_for_user(
+            exam_list[0], user_list[1], self.key
+        )
+        student_allowance_exam2 = ProctoredExamStudentAllowance.get_allowance_for_user(
+            exam_list[1], user_list[1], self.key
+        )
+        all_course_allowances = get_allowances_for_course(self.course_id)
+        self.assertEqual(len(all_course_allowances), 6)
+        self.assertIsNotNone(student_allowance)
+        self.assertEqual(student_allowance.value, exam1_allowance)
+        self.assertEqual(student_allowance_exam2.value, exam2_allowance)
+        self.assertEqual(successes, 6)
+        self.assertEqual(failures, 0)
+
+    def test_add_same_user_bulk_allowance(self):
+        """
+        Test to add bulk allowances with the same user twice.
+        """
+        user_list = self.create_batch_users(3)
+        user_list.append(user_list[1])
+        exam_list = []
+        exam_list.extend(
+            (create_exam(
+                        course_id=self.course_id,
+                        content_id="1st exam",
+                        exam_name="1st exam",
+                        time_limit_mins=self.default_time_limit,
+                        is_practice_exam=False,
+                        is_proctored=True
+            ),
+                        create_exam(
+                        course_id=self.course_id,
+                        content_id="2nd exam",
+                        exam_name="2nd exam",
+                        time_limit_mins=90,
+                        is_practice_exam=False,
+                        is_proctored=True
+            ))
+        )
+        _, successes, failures = add_bulk_allowances(exam_list, user_list, TIME_MULTIPLIER, '1.5')
+        student_allowance = ProctoredExamStudentAllowance.get_allowance_for_user(
+            exam_list[0], user_list[1], self.key
+        )
+        all_course_allowances = get_allowances_for_course(self.course_id)
+        self.assertEqual(len(all_course_allowances), 6)
+        self.assertIsNotNone(student_allowance)
+        self.assertEqual(len(user_list), 4)
+        self.assertEqual(successes, 6)
+        self.assertEqual(failures, 0)
+
+    def test_add_same_exam_bulk_allowance(self):
+        """
+        Test to add bulk allowances with the same exam twice.
+        """
+        user_list = self.create_batch_users(3)
+        user_list.append(user_list[1])
+        exam_list = []
+        exam_list.extend(
+            (create_exam(
+                        course_id=self.course_id,
+                        content_id="1st exam",
+                        exam_name="1st exam",
+                        time_limit_mins=self.default_time_limit,
+                        is_practice_exam=False,
+                        is_proctored=True
+                        ),
+             create_exam(
+                        course_id=self.course_id,
+                        content_id="2nd exam",
+                        exam_name="2nd exam",
+                        time_limit_mins=90,
+                        is_practice_exam=False,
+                        is_proctored=True
+            ))
+        )
+        exam_list.append(exam_list[0])
+        _, successes, failures = add_bulk_allowances(exam_list, user_list, TIME_MULTIPLIER, '1.5')
+        student_allowance = ProctoredExamStudentAllowance.get_allowance_for_user(
+            exam_list[0], user_list[1], self.key
+        )
+        all_course_allowances = get_allowances_for_course(self.course_id)
+        self.assertEqual(len(all_course_allowances), 6)
+        self.assertIsNotNone(student_allowance)
+        self.assertEqual(len(exam_list), 3)
+        self.assertEqual(successes, 6)
+        self.assertEqual(failures, 0)
+
+    @ddt.data(
+        (
+            ADDITIONAL_TIME,
+            '30',
+            '30',
+            '30'
+        ),
+        (
+            TIME_MULTIPLIER,
+            '1.5',
+            '10',
+            '45'
+        )
+    )
+    @ddt.unpack
+    def test_add_bulk_allowance_invalid_user(self, allowance_type, value, exam1_allowance, exam2_allowance):
+        """
+        Add bulk allowance with an invalid user
+        """
+        user_list = self.create_batch_users(3)
+        user_list.append('invalid_user')
+        exam_list = []
+        exam_list.extend(
+            (create_exam(
+                        course_id=self.course_id,
+                        content_id="1st exam",
+                        exam_name="1st exam",
+                        time_limit_mins=self.default_time_limit,
+                        is_practice_exam=False,
+                        is_proctored=True
+            ),
+             create_exam(
+                    course_id=self.course_id,
+                    content_id="2nd exam",
+                    exam_name="2nd exam",
+                    time_limit_mins=90,
+                    is_practice_exam=False,
+                    is_proctored=True
+            ))
+        )
+        _, successes, failures = add_bulk_allowances(exam_list, user_list, allowance_type, value)
+        student_allowance = ProctoredExamStudentAllowance.get_allowance_for_user(
+            exam_list[0], user_list[1], self.key
+        )
+        student_allowance_exam2 = ProctoredExamStudentAllowance.get_allowance_for_user(
+            exam_list[1], user_list[1], self.key
+        )
+        all_course_allowances = get_allowances_for_course(self.course_id)
+        self.assertEqual(len(all_course_allowances), 6)
+        self.assertIsNotNone(student_allowance)
+        self.assertEqual(student_allowance.value, exam1_allowance)
+        self.assertEqual(student_allowance_exam2.value, exam2_allowance)
+        self.assertEqual(failures, 2)
+        self.assertEqual(successes, 6)
+
+    @ddt.data(
+        (
+            ADDITIONAL_TIME,
+            '30',
+            '30',
+            '30'
+        ),
+        (
+            TIME_MULTIPLIER,
+            '1.5',
+            '10',
+            '45'
+        )
+    )
+    @ddt.unpack
+    def test_add_bulk_allowance_invalid_exam(self, allowance_type, value, exam1_allowance, exam2_allowance):
+        """
+        Add bulk allowance with invalid exam
+        """
+        user_list = self.create_batch_users(3)
+        exam_list = []
+        exam_list.extend(
+            (create_exam(
+                        course_id=self.course_id,
+                        content_id="1st exam",
+                        exam_name="1st exam",
+                        time_limit_mins=self.default_time_limit,
+                        is_practice_exam=False,
+                        is_proctored=True
+            ),
+             create_exam(
+                    course_id=self.course_id,
+                    content_id="2nd exam",
+                    exam_name="2nd exam",
+                    time_limit_mins=90,
+                    is_practice_exam=False,
+                    is_proctored=True
+            ),
+             -99)
+        )
+        _, successes, failures = add_bulk_allowances(exam_list, user_list, allowance_type, value)
+        student_allowance = ProctoredExamStudentAllowance.get_allowance_for_user(
+            exam_list[0], user_list[1], self.key
+        )
+        student_allowance_exam2 = ProctoredExamStudentAllowance.get_allowance_for_user(
+            exam_list[1], user_list[1], self.key
+        )
+        all_course_allowances = get_allowances_for_course(self.course_id)
+        self.assertEqual(len(all_course_allowances), 6)
+        self.assertIsNotNone(student_allowance)
+        self.assertEqual(student_allowance.value, exam1_allowance)
+        self.assertEqual(student_allowance_exam2.value, exam2_allowance)
+        self.assertEqual(failures, 3)
+        self.assertEqual(successes, 6)
+
+    @ddt.data(
+        (
+            ADDITIONAL_TIME,
+            '3.0'
+        ),
+        (
+            ADDITIONAL_TIME,
+            'invalid'
+        ),
+        (
+            ADDITIONAL_TIME,
+            '-30'
+        ),
+        (
+            ADDITIONAL_TIME,
+            'd30'
+        ),
+        (
+            TIME_MULTIPLIER,
+            '-10'
+        ),
+        (
+            TIME_MULTIPLIER,
+            'd30'
+        ),
+        (
+            TIME_MULTIPLIER,
+            'invalid'
+        ),
+        (
+            TIME_MULTIPLIER,
+            '.5'
+        ),
+    )
+    @ddt.unpack
+    def test_add_bulk_allowance_invalid_value(self, allowance_type, value):
+        """
+        Add bulk allowance with an invalid allowance value
+        """
+        user_list = self.create_batch_users(3)
+        user_list.append('invalid_user')
+        exam_list = []
+        exam_list.extend(
+            (create_exam(
+                        course_id=self.course_id,
+                        content_id="1st exam",
+                        exam_name="1st exam",
+                        time_limit_mins=self.default_time_limit,
+                        is_practice_exam=False,
+                        is_proctored=True
+            ),
+             create_exam(
+                    course_id=self.course_id,
+                    content_id="2nd exam",
+                    exam_name="2nd exam",
+                    time_limit_mins=90,
+                    is_practice_exam=False,
+                    is_proctored=True
+            ))
+        )
+        with self.assertRaises(AllowanceValueNotAllowedException):
+            add_bulk_allowances(exam_list, user_list, allowance_type, value)
+
+    def test_add_no_exams_bulk_allowance(self):
+        """
+        Test to add bulk allowances with no exams.
+        """
+        user_list = self.create_batch_users(3)
+        exam_list = []
+        _, successes, failures = add_bulk_allowances(exam_list, user_list, TIME_MULTIPLIER, '1.5')
+        self.assertEqual(successes, 0)
+        self.assertEqual(failures, 0)
+
+    def test_add_no_users_bulk_allowance(self):
+        """
+        Test to add bulk allowances with no users.
+        """
+
+        exam_list = []
+        exam_list.extend(
+            (create_exam(
+                        course_id=self.course_id,
+                        content_id="1st exam",
+                        exam_name="1st exam",
+                        time_limit_mins=self.default_time_limit,
+                        is_practice_exam=False,
+                        is_proctored=True
+            ),
+             create_exam(
+                    course_id=self.course_id,
+                    content_id="2nd exam",
+                    exam_name="2nd exam",
+                    time_limit_mins=90,
+                    is_practice_exam=False,
+                    is_proctored=True
+            ))
+        )
+        user_list = []
+        _, successes, failures = add_bulk_allowances(exam_list, user_list, TIME_MULTIPLIER, '1.5')
+        self.assertEqual(successes, 0)
+        self.assertEqual(failures, 0)
+
+    def test_add_all_invalid_bulk_allowance(self):
+        """
+        Test to add bulk allowances with all invalid data.
+        """
+
+        exam_list = [-99, -98]
+        user_list = ['invalid1', 'invalid2']
+        _, successes, failures = add_bulk_allowances(exam_list, user_list, TIME_MULTIPLIER, '1.5')
+        self.assertEqual(successes, 0)
+        self.assertEqual(failures, 4)
+
     def test_exam_attempt_with_due_datetime(self):
         """
         Test the exam attempt with due date
@@ -502,6 +873,27 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
             attempt = get_exam_attempt_by_id(attempt_id)
             self.assertLessEqual(minutes_before_past_due_date - 1, attempt['allowed_time_limit_mins'])
             self.assertLessEqual(attempt['allowed_time_limit_mins'], minutes_before_past_due_date)
+
+    def test_no_time_limit_if_not_started(self):
+        """
+        Test the the time limit is not calculated before an attempt is started.
+        """
+        attempt_id = create_exam_attempt(exam_id=self.proctored_exam_id, user_id=self.user_id)
+        attempt = get_exam_attempt_by_id(attempt_id)
+        self.assertIsNone(attempt['allowed_time_limit_mins'])
+
+    def test_resumed_exam_attempt_time_limit(self):
+        """
+        Test that a resumed exam attempt accounts for the time remaining when calculating the time limit
+        """
+        attempt_id = create_exam_attempt(exam_id=self.proctored_exam_id, user_id=self.user_id)
+        update_exam_attempt(attempt_id, time_remaining_seconds=60)
+        with freeze_time(datetime.now(pytz.UTC)):
+            start_exam_attempt(self.proctored_exam_id, self.user_id)
+            attempt = get_exam_attempt_by_id(attempt_id)
+            # assert that the time limit matches the saved time remaining, rather than the exam's
+            # default time limit
+            self.assertEqual(attempt['allowed_time_limit_mins'], 1)
 
     @ddt.data(
         True,
@@ -576,6 +968,50 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
         self.assertEqual(attempt['allowed_time_limit_mins'], self.default_time_limit + allowed_extra_time)
 
     @ddt.data(
+        ProctoredExamStudentAttemptStatus.ready_to_resume,
+        ProctoredExamStudentAttemptStatus.resumed,
+    )
+    def test_resume_exam_attempt(self, status):
+        """
+        Create a resumed exam attempt with remaining time saved from the previous attempt.
+        """
+        # create an attempt that has been marked ready to resume
+        initial_attempt = self._create_exam_attempt(self.proctored_exam_id, status)
+        # populate the remaining time
+        initial_attempt.time_remaining_seconds = 600
+        initial_attempt.save()
+
+        # create a new attempt, which should save the remaining time
+        # and update the previous attempt's status to 'resumed'
+        current_attempt_id = create_exam_attempt(self.proctored_exam_id, self.user_id)
+        previous_attempt = get_exam_attempt_by_id(initial_attempt.id)
+        current_attempt = get_exam_attempt_by_id(current_attempt_id)
+        self.assertEqual(current_attempt['time_remaining_seconds'], 600)
+        self.assertEqual(previous_attempt['status'], ProctoredExamStudentAttemptStatus.resumed)
+
+    @ddt.data(
+        ProctoredExamStudentAttemptStatus.eligible,
+        ProctoredExamStudentAttemptStatus.created,
+        ProctoredExamStudentAttemptStatus.download_software_clicked,
+        ProctoredExamStudentAttemptStatus.ready_to_start,
+        ProctoredExamStudentAttemptStatus.started,
+        ProctoredExamStudentAttemptStatus.ready_to_submit,
+        ProctoredExamStudentAttemptStatus.declined,
+        ProctoredExamStudentAttemptStatus.timed_out,
+        ProctoredExamStudentAttemptStatus.submitted,
+        ProctoredExamStudentAttemptStatus.second_review_required,
+        ProctoredExamStudentAttemptStatus.rejected,
+        ProctoredExamStudentAttemptStatus.expired
+    )
+    def test_resume_from_invalid_attempt(self, status):
+        """
+        An exam cannot be resumed if the previous attempt is not 'ready to resume' or 'resumed'
+        """
+        self._create_exam_attempt(self.proctored_exam_id, status)
+        with self.assertRaises(StudentExamAttemptAlreadyExistsException):
+            create_exam_attempt(self.proctored_exam_id, self.user_id)
+
+    @ddt.data(
         *ProctoredExamStudentAttemptStatus.onboarding_errors
     )
     def test_attempt_onboarding_error(self, onboarding_error):
@@ -629,15 +1065,36 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
         new_attempt_id = create_exam_attempt(practice_exam_student_attempt.proctored_exam.id, self.user_id)
         self.assertGreater(new_attempt_id, practice_exam_student_attempt.id, "New attempt not created.")
 
-    def test_get_exam_attempt(self):
+    def test_get_current_exam_attempt(self):
         """
-        Test to get the existing exam attempt.
+        Test to get the current exam attempt. Old attempts should be ignored
         """
-        self._create_unstarted_exam_attempt()
-        exam_attempt = get_exam_attempt(self.proctored_exam_id, self.user_id)
+        self._create_exam_attempt(self.proctored_exam_id, ProctoredExamStudentAttemptStatus.error)
+        recent_attempt = self._create_unstarted_exam_attempt()
+        exam_attempt = get_current_exam_attempt(self.proctored_exam_id, self.user_id)
 
         self.assertEqual(exam_attempt['proctored_exam']['id'], self.proctored_exam_id)
         self.assertEqual(exam_attempt['user']['id'], self.user_id)
+        self.assertEqual(exam_attempt['id'], recent_attempt.id)
+
+    def test_get_user_attempts_by_exam_id(self):
+        """
+        Test to get all attempts by exam id
+        """
+        first_attempt_id = create_exam_attempt(self.proctored_exam_id, self.user_id, taking_as_proctored=True)
+        update_attempt_status(first_attempt_id, ProctoredExamStudentAttemptStatus.error)
+        update_attempt_status(first_attempt_id, ProctoredExamStudentAttemptStatus.ready_to_resume)
+
+        second_attempt_id = create_exam_attempt(self.proctored_exam_id, self.user_id, taking_as_proctored=True)
+        update_attempt_status(second_attempt_id, ProctoredExamStudentAttemptStatus.error)
+        update_attempt_status(second_attempt_id, ProctoredExamStudentAttemptStatus.ready_to_resume)
+
+        third_attempt_id = create_exam_attempt(self.proctored_exam_id, self.user_id, taking_as_proctored=True)
+        update_attempt_status(third_attempt_id, ProctoredExamStudentAttemptStatus.error)
+        update_attempt_status(third_attempt_id, ProctoredExamStudentAttemptStatus.ready_to_resume)
+
+        attempts = get_user_attempts_by_exam_id(self.user_id, self.proctored_exam_id)
+        self.assertEqual(len(attempts), 3)
 
     def test_start_uncreated_attempt(self):
         """
@@ -680,7 +1137,7 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
         proctored_exam_student_attempt = self._create_unstarted_exam_attempt()
         self.assertIsNone(proctored_exam_student_attempt.completed_at)
         proctored_exam_attempt_id = stop_exam_attempt(
-            proctored_exam_student_attempt.proctored_exam.id, self.user_id
+            proctored_exam_student_attempt.id
         )
         self.assertEqual(proctored_exam_student_attempt.id, proctored_exam_attempt_id)
 
@@ -728,8 +1185,7 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
 
         exam_attempt = self._create_started_exam_attempt()
         update_attempt_status(
-            exam_attempt.proctored_exam_id,
-            self.user.id,
+            exam_attempt.id,
             to_status
         )
 
@@ -756,12 +1212,73 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
             # given the attempt status
             self.assertEqual(len(credit_status['credit_requirement_status']), 0)
 
+    def test_reset_practice_exam(self):
+        """
+        Reset returns a user's exam attempt to the created state
+        """
+        with self.assertRaises(StudentExamAttemptDoesNotExistsException):
+            reset_practice_exam(self.practice_exam_id, self.user_id, self.user)
+
+        practice_attempt = self._create_exam_attempt(
+            self.practice_exam_id,
+            status=ProctoredExamStudentAttemptStatus.rejected,
+            is_practice_exam=True,
+        )
+        reset_practice_exam(self.practice_exam_id, self.user_id, self.user)
+
+        current_attempt = ProctoredExamStudentAttempt.objects.get_current_exam_attempt(
+            self.practice_exam_id, self.user.id
+        )
+        self.assertEqual(current_attempt.status, ProctoredExamStudentAttemptStatus.created)
+        self.assertIsNone(current_attempt.started_at)
+        self.assertIsNone(current_attempt.completed_at)
+        self.assertIsNone(current_attempt.allowed_time_limit_mins)
+
+        practice_attempt.refresh_from_db()
+        self.assertEqual(practice_attempt.status, ProctoredExamStudentAttemptStatus.onboarding_reset)
+
+    def test_reset_exam_in_progress(self):
+        """
+        If an attempt is in progress it may not be reset
+        """
+        self._create_exam_attempt(
+            self.practice_exam_id,
+            status=ProctoredExamStudentAttemptStatus.started,
+            is_practice_exam=True,
+        )
+        with self.assertRaises(ProctoredExamIllegalStatusTransition):
+            reset_practice_exam(self.practice_exam_id, self.user_id, self.user)
+
+    def test_reset_non_practice_exam(self):
+        """
+        Only practice exams may be reset
+        """
+        self._create_exam_attempt(
+            self.proctored_exam_id,
+            status=ProctoredExamStudentAttemptStatus.rejected,
+            is_practice_exam=True,
+        )
+        with self.assertRaises(ProctoredExamIllegalStatusTransition):
+            reset_practice_exam(self.proctored_exam_id, self.user_id, self.user)
+
+    def test_reset_verified_exam(self):
+        """
+        If an attempt has been verified it may not be reset
+        """
+        self._create_exam_attempt(
+            self.practice_exam_id,
+            status=ProctoredExamStudentAttemptStatus.verified,
+            is_practice_exam=True,
+        )
+        with self.assertRaises(ProctoredExamIllegalStatusTransition):
+            reset_practice_exam(self.practice_exam_id, self.user_id, self.user)
+
     def test_stop_a_non_started_exam(self):
         """
         Stop an exam attempt that had not started yet.
         """
         with self.assertRaises(StudentExamAttemptDoesNotExistsException):
-            stop_exam_attempt(self.proctored_exam_id, self.user_id)
+            stop_exam_attempt(0)
 
     def test_mark_exam_attempt_timeout(self):
         """
@@ -769,12 +1286,12 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
         """
 
         with self.assertRaises(StudentExamAttemptDoesNotExistsException):
-            mark_exam_attempt_timeout(self.proctored_exam_id, self.user_id)
+            mark_exam_attempt_timeout(0)
 
         proctored_exam_student_attempt = self._create_unstarted_exam_attempt()
         self.assertIsNone(proctored_exam_student_attempt.completed_at)
         proctored_exam_attempt_id = mark_exam_attempt_timeout(
-            proctored_exam_student_attempt.proctored_exam.id, self.user_id
+            proctored_exam_student_attempt.id
         )
         self.assertEqual(proctored_exam_student_attempt.id, proctored_exam_attempt_id)
 
@@ -784,12 +1301,12 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
         """
 
         with self.assertRaises(StudentExamAttemptDoesNotExistsException):
-            mark_exam_attempt_as_ready(self.proctored_exam_id, self.user_id)
+            mark_exam_attempt_as_ready(0)
 
         proctored_exam_student_attempt = self._create_unstarted_exam_attempt()
         self.assertIsNone(proctored_exam_student_attempt.completed_at)
         proctored_exam_attempt_id = mark_exam_attempt_as_ready(
-            proctored_exam_student_attempt.proctored_exam.id, self.user_id
+            proctored_exam_student_attempt.id
         )
         self.assertEqual(proctored_exam_student_attempt.id, proctored_exam_attempt_id)
 
@@ -840,6 +1357,35 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
         self.assertEqual(len(filtered_attempts), 2)
         self.assertEqual(filtered_attempts[0]['id'], new_exam_attempt)
         self.assertEqual(filtered_attempts[1]['id'], exam_attempt.id)
+
+    def test_get_filtered_exam_attempts_resumed(self):
+        """
+        Test to get all exam attempts from a single user who has resumed from previous attempts.
+        """
+        # create the first attempt
+        first_exam_attempt = self._create_exam_attempt(
+            exam_id=self.proctored_exam_id,
+            status=ProctoredExamStudentAttemptStatus.ready_to_resume,
+            time_remaining_seconds=600
+        )
+        # create the second attempt, transitioning from error to ready_to_resume
+        second_exam_attempt_id = create_exam_attempt(exam_id=self.proctored_exam_id, user_id=self.user_id)
+        update_attempt_status(second_exam_attempt_id, ProctoredExamStudentAttemptStatus.error)
+        update_exam_attempt(second_exam_attempt_id, time_remaining_seconds=500)
+        update_attempt_status(second_exam_attempt_id, ProctoredExamStudentAttemptStatus.ready_to_resume)
+        # create the third attempt, then assert that all attempts return correctly
+        third_exam_attempt_id = create_exam_attempt(exam_id=self.proctored_exam_id, user_id=self.user_id)
+        all_attempts = get_filtered_exam_attempts(self.course_id, self.user.username)
+        self.assertEqual(len(all_attempts), 3)
+        self.assertEqual(all_attempts[0]['id'], third_exam_attempt_id)
+        self.assertEqual(all_attempts[1]['id'], second_exam_attempt_id)
+        self.assertEqual(all_attempts[2]['id'], first_exam_attempt.id)
+        # the time remaining on the newest attempt should match the previous attempt
+        self.assertEqual(all_attempts[0]['time_remaining_seconds'], all_attempts[1]['time_remaining_seconds'])
+        # when a new attempt is created, the previous attempt should transition from ready_to_resume to resumed
+        self.assertEqual(all_attempts[0]['status'], ProctoredExamStudentAttemptStatus.created)
+        self.assertEqual(all_attempts[1]['status'], ProctoredExamStudentAttemptStatus.resumed)
+        self.assertEqual(all_attempts[2]['status'], ProctoredExamStudentAttemptStatus.resumed)
 
     def test_get_last_exam_completion_date_when_course_is_incomplete(self):
         """
@@ -904,8 +1450,7 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
         """
         exam_attempt = self._create_started_exam_attempt()
         update_attempt_status(
-            exam_attempt.proctored_exam_id,
-            self.user.id,
+            exam_attempt.id,
             ProctoredExamStudentAttemptStatus.submitted
         )
 
@@ -925,8 +1470,7 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
         """
         exam_attempt = self._create_started_exam_attempt()
         update_attempt_status(
-            exam_attempt.proctored_exam_id,
-            self.user.id,
+            exam_attempt.id,
             ProctoredExamStudentAttemptStatus.error
         )
 
@@ -969,6 +1513,12 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
             True,
             ProctoredExamStudentAttemptStatus.submitted,
             ProctoredExamStudentAttemptStatus.submitted
+        ),
+        (
+            ProctoredExamStudentAttemptStatus.declined,
+            True,
+            ProctoredExamStudentAttemptStatus.created,
+            ProctoredExamStudentAttemptStatus.declined
         ),
     )
     @ddt.unpack
@@ -1018,24 +1568,23 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
         )
 
         if create_attempt:
-            create_exam_attempt(second_exam_id, self.user_id, taking_as_proctored=False)
+            attempt_id = create_exam_attempt(second_exam_id, self.user_id, taking_as_proctored=False)
 
             if second_attempt_status:
-                update_attempt_status(second_exam_id, self.user_id, second_attempt_status)
+                update_attempt_status(attempt_id, second_attempt_status)
 
         exam_attempt = self._create_started_exam_attempt()
         update_attempt_status(
-            exam_attempt.proctored_exam_id,
-            self.user.id,
+            exam_attempt.id,
             to_status
         )
 
         # make sure we reamain in the right status
-        read_back = get_exam_attempt(exam_attempt.proctored_exam_id, self.user.id)
+        read_back = get_current_exam_attempt(exam_attempt.proctored_exam_id, self.user.id)
         self.assertEqual(read_back['status'], to_status)
 
         # make sure an attempt was made for second_exam
-        second_exam_attempt = get_exam_attempt(second_exam_id, self.user_id)
+        second_exam_attempt = get_current_exam_attempt(second_exam_id, self.user_id)
         if expected_second_status:
             self.assertIsNotNone(second_exam_attempt)
             self.assertEqual(second_exam_attempt['status'], expected_second_status)
@@ -1043,9 +1592,9 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
             self.assertIsNone(second_exam_attempt)
 
         # no auto-generated attempts for practice and timed exams
-        self.assertIsNone(get_exam_attempt(practice_exam_id, self.user_id))
-        self.assertIsNone(get_exam_attempt(timed_exam_id, self.user_id))
-        self.assertIsNone(get_exam_attempt(inactive_exam_id, self.user_id))
+        self.assertIsNone(get_current_exam_attempt(practice_exam_id, self.user_id))
+        self.assertIsNone(get_current_exam_attempt(timed_exam_id, self.user_id))
+        self.assertIsNone(get_current_exam_attempt(inactive_exam_id, self.user_id))
 
     def test_grade_override(self):
         """
@@ -1068,8 +1617,7 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
         )
 
         update_attempt_status(
-            exam_attempt.proctored_exam_id,
-            self.user.id,
+            exam_attempt.id,
             ProctoredExamStudentAttemptStatus.rejected
         )
 
@@ -1129,8 +1677,7 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
         # will remove the override for the learner's subsection grade on the exam that was created
         # when the attempt entered the rejected state.
         update_attempt_status(
-            exam_attempt.proctored_exam_id,
-            self.user.id,
+            exam_attempt.id,
             ProctoredExamStudentAttemptStatus.verified
         )
 
@@ -1165,8 +1712,7 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
         set_runtime_service('grades', grades_service)
         exam_attempt = self._create_started_exam_attempt()
         update_attempt_status(
-            exam_attempt.proctored_exam_id,
-            self.user.id,
+            exam_attempt.id,
             ProctoredExamStudentAttemptStatus.rejected,
             update_attributable_to=self.user
         )
@@ -1184,8 +1730,7 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
         set_runtime_service('grades', grades_service)
         exam_attempt = self._create_started_exam_attempt()
         update_attempt_status(
-            exam_attempt.proctored_exam_id,
-            self.user.id,
+            exam_attempt.id,
             ProctoredExamStudentAttemptStatus.rejected
         )
 
@@ -1212,8 +1757,7 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
         )
 
         update_attempt_status(
-            exam_attempt.proctored_exam_id,
-            self.user.id,
+            exam_attempt.id,
             ProctoredExamStudentAttemptStatus.rejected
         )
 
@@ -1243,8 +1787,7 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
 
         # Transitioning from rejected to verified will also have no effect
         update_attempt_status(
-            exam_attempt.proctored_exam_id,
-            self.user.id,
+            exam_attempt.id,
             ProctoredExamStudentAttemptStatus.verified
         )
 
@@ -1289,15 +1832,13 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
 
         exam_attempt = self._create_started_exam_attempt()
         update_attempt_status(
-            exam_attempt.proctored_exam_id,
-            self.user.id,
+            exam_attempt.id,
             from_status
         )
 
         with self.assertRaises(ProctoredExamIllegalStatusTransition):
             update_attempt_status(
-                exam_attempt.proctored_exam_id,
-                self.user.id,
+                exam_attempt.id,
                 to_status
             )
 
@@ -1310,8 +1851,7 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
         exam_attempt = self._create_started_exam_attempt()
         random_timestamp = datetime.now(pytz.UTC) - timedelta(hours=4)
         update_attempt_status(
-            exam_attempt.proctored_exam_id,
-            self.user.id,
+            exam_attempt.id,
             ProctoredExamStudentAttemptStatus.timed_out,
             timeout_timestamp=random_timestamp
         )
@@ -1352,8 +1892,7 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
         exam_attempt = self._create_exam_attempt(self.proctored_exam_id, from_status)
 
         update_attempt_status(
-            exam_attempt.proctored_exam_id,
-            self.user.id,
+            exam_attempt.id,
             to_status,
         )
         exam_attempt = get_exam_attempt_by_id(exam_attempt.id)
@@ -1377,8 +1916,7 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
         exam_attempt.proctored_exam.save()
 
         update_attempt_status(
-            exam_attempt.proctored_exam_id,
-            self.user.id,
+            exam_attempt.id,
             ProctoredExamStudentAttemptStatus.started
         )
 
@@ -1402,8 +1940,7 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
         exam_attempt = self._create_started_exam_attempt()
         random_timestamp = datetime.now(pytz.UTC) - timedelta(hours=4)
         update_attempt_status(
-            exam_attempt.proctored_exam_id,
-            self.user.id,
+            exam_attempt.id,
             ProctoredExamStudentAttemptStatus.timed_out,
             timeout_timestamp=random_timestamp
         )
@@ -1426,12 +1963,11 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
         """
 
         with self.assertRaises(StudentExamAttemptDoesNotExistsException):
-            update_attempt_status(0, 0, ProctoredExamStudentAttemptStatus.timed_out)
+            update_attempt_status(0, ProctoredExamStudentAttemptStatus.timed_out)
 
         # also check the raise_if_not_found flag
         self.assertIsNone(
             update_attempt_status(
-                0,
                 0,
                 ProctoredExamStudentAttemptStatus.timed_out,
                 raise_if_not_found=False
@@ -1445,12 +1981,38 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
         exam_attempt = self._create_started_exam_attempt()
         set_runtime_service('credit', MockCreditServiceNone())
         new_attempt = update_attempt_status(
-            exam_attempt.proctored_exam_id,
-            self.user.id,
+            exam_attempt.id,
             ProctoredExamStudentAttemptStatus.verified
         )
 
         self.assertEqual(new_attempt, exam_attempt.id)
+
+    @patch.object(TestBackendProvider, 'start_exam_attempt')
+    def test_update_attempt_multiple_starts(self, mock_backend_start):
+        """
+        Test that updating an attempt status to `started` more than once
+        will only call the backend's start_exam_attempt once
+        """
+        exam_attempt = self._create_exam_attempt(self.proctored_exam_id)
+        update_attempt_status(
+            exam_attempt.id,
+            ProctoredExamStudentAttemptStatus.started
+        )
+        mock_backend_start.assert_called_once()
+
+        # move status to ready to submit
+        update_attempt_status(
+            exam_attempt.id,
+            ProctoredExamStudentAttemptStatus.ready_to_submit
+        )
+        # move status to started
+        update_attempt_status(
+            exam_attempt.id,
+            ProctoredExamStudentAttemptStatus.started
+        )
+
+        # make sure that method was not called again
+        mock_backend_start.assert_called_once()
 
     @ddt.data(
         (
@@ -1567,8 +2129,7 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
 
         exam_attempt = self._create_exam_attempt(self.proctored_exam_id)
         update_attempt_status(
-            exam_attempt.proctored_exam_id,
-            self.user.id,
+            exam_attempt.id,
             status
         )
 
@@ -1614,8 +2175,7 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
 
         exam_attempt = self._create_started_practice_exam_attempt()
         update_attempt_status(
-            exam_attempt.proctored_exam_id,
-            self.user.id,
+            exam_attempt.id,
             status
         )
 
@@ -1688,8 +2248,7 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
         exam_attempt = self._create_started_practice_exam_attempt()
 
         update_attempt_status(
-            exam_attempt.proctored_exam_id,
-            self.user.id,
+            exam_attempt.id,
             status
         )
 
@@ -1747,6 +2306,29 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
 
         self.assertIsNone(summary)
 
+    def test_proctored_exam_status_summary_no_credit_service(self):
+        """
+        Assert that we get the expected status summary.
+
+        Cover case that credit service is unavailable.
+        """
+        set_runtime_service('credit', None)
+        expected = {
+            'status': ProctoredExamStudentAttemptStatus.eligible,
+            'short_description': 'Proctored Option Available',
+            'suggested_icon': 'fa-pencil-square-o',
+            'in_completed_state': False
+        }
+
+        exam = get_exam_by_id(self.proctored_exam_id)
+
+        summary = get_attempt_status_summary(
+            self.user.id,
+            exam['course_id'],
+            exam['content_id']
+        )
+        self.assertIn(summary, [expected])
+
     def test_status_summary_bad(self):
         """
         Make sure we get back a None when getting summary for content that does not
@@ -1773,6 +2355,7 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
                 exam_attempt.id,
                 last_poll_timestamp=datetime.utcnow(),
                 last_poll_ipaddr='1.1.1.1',
+                time_remaining_seconds=600,
                 status='foo'
             )
 
@@ -1781,12 +2364,177 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
             exam_attempt.id,
             last_poll_timestamp=now,
             last_poll_ipaddr='1.1.1.1',
+            time_remaining_seconds=600,
         )
 
         attempt = get_exam_attempt_by_id(exam_attempt.id)
 
         self.assertEqual(attempt['last_poll_timestamp'], now)
         self.assertEqual(attempt['last_poll_ipaddr'], '1.1.1.1')
+        self.assertEqual(attempt['time_remaining_seconds'], 600)
+
+    @ddt.data(
+        ProctoredExamStudentAttemptStatus.eligible,
+        ProctoredExamStudentAttemptStatus.created,
+        ProctoredExamStudentAttemptStatus.download_software_clicked,
+        ProctoredExamStudentAttemptStatus.ready_to_start,
+        ProctoredExamStudentAttemptStatus.started,
+        ProctoredExamStudentAttemptStatus.ready_to_submit,
+        ProctoredExamStudentAttemptStatus.declined,
+        ProctoredExamStudentAttemptStatus.timed_out,
+        ProctoredExamStudentAttemptStatus.submitted,
+        ProctoredExamStudentAttemptStatus.second_review_required,
+        ProctoredExamStudentAttemptStatus.rejected,
+        ProctoredExamStudentAttemptStatus.expired,
+        ProctoredExamStudentAttemptStatus.resumed
+    )
+    def test_update_exam_attempt_ready_to_resume_invalid_transition(self, initial_status):
+        """
+        Assert that an attempted transition of a proctored exam attempt from a non-error state
+        to the ready_to_resume_state raises a ProctoredExamIllegalStatusTransition exception.
+        """
+        exam_attempt = self._create_exam_attempt(self.proctored_exam_id, status=initial_status)
+
+        with self.assertRaises(ProctoredExamIllegalStatusTransition):
+            update_attempt_status(
+                exam_attempt.id,
+                ProctoredExamStudentAttemptStatus.ready_to_resume
+            )
+
+    @ddt.data(
+        ProctoredExamStudentAttemptStatus.error,
+        ProctoredExamStudentAttemptStatus.verified,
+        ProctoredExamStudentAttemptStatus.second_review_required,
+        ProctoredExamStudentAttemptStatus.rejected
+    )
+    def test_update_exam_attempt_ready_to_resume(self, resumable_status):
+        """
+        Assert that an attempted transition of a proctored exam attempt from an error state
+        to a ready_to_resume state completes successfully and does not raise a
+        ProctoredExamIllegalStatusTransition exception.
+        """
+        exam_attempt = self._create_started_exam_attempt()
+
+        attempt = get_exam_attempt_by_id(exam_attempt.id)
+        self.assertEqual(attempt['status'], ProctoredExamStudentAttemptStatus.started)
+
+        # First we have to transition to error state to make the exam attempt resumable
+        update_attempt_status(
+            exam_attempt.id,
+            ProctoredExamStudentAttemptStatus.error
+        )
+
+        update_attempt_status(
+            exam_attempt.id,
+            resumable_status
+        )
+
+        attempt = get_exam_attempt_by_id(exam_attempt.id)
+        self.assertEqual(attempt['status'], resumable_status)
+
+        update_attempt_status(
+            exam_attempt.id,
+            ProctoredExamStudentAttemptStatus.ready_to_resume
+        )
+
+        attempt = get_exam_attempt_by_id(exam_attempt.id)
+        self.assertEqual(attempt['status'], ProctoredExamStudentAttemptStatus.ready_to_resume)
+
+    @ddt.data(
+        ProctoredExamStudentAttemptStatus.eligible,
+        ProctoredExamStudentAttemptStatus.created,
+        ProctoredExamStudentAttemptStatus.download_software_clicked,
+        ProctoredExamStudentAttemptStatus.ready_to_start,
+        ProctoredExamStudentAttemptStatus.started,
+        ProctoredExamStudentAttemptStatus.ready_to_submit,
+        ProctoredExamStudentAttemptStatus.declined,
+        ProctoredExamStudentAttemptStatus.timed_out,
+        ProctoredExamStudentAttemptStatus.submitted,
+        ProctoredExamStudentAttemptStatus.second_review_required,
+        ProctoredExamStudentAttemptStatus.rejected,
+        ProctoredExamStudentAttemptStatus.expired
+    )
+    def test_update_exam_attempt_resumed_invalid_transition(self, from_status):
+        """
+        Assert that an attempted transition of a proctored exam attempt to 'resumed' from a state
+        that is not 'ready_to_resume' or 'resumed' raises an exception.
+        """
+        exam_attempt = self._create_exam_attempt(self.proctored_exam_id, status=from_status)
+
+        with self.assertRaises(ProctoredExamIllegalStatusTransition):
+            update_attempt_status(
+                exam_attempt.id,
+                ProctoredExamStudentAttemptStatus.resumed
+            )
+
+    @ddt.data(
+        ProctoredExamStudentAttemptStatus.ready_to_resume,
+        ProctoredExamStudentAttemptStatus.resumed
+    )
+    def test_update_exam_attempt_resumed(self, from_status):
+        """
+        Assert that transition status to 'resumed' is successful if the previous status is
+        'ready_to_resume' or 'resumed'.
+        """
+        exam_attempt = self._create_exam_attempt(self.proctored_exam_id, status=from_status)
+        update_attempt_status(
+            exam_attempt.id,
+            ProctoredExamStudentAttemptStatus.resumed
+        )
+        attempt = get_exam_attempt_by_id(exam_attempt.id)
+        self.assertEqual(attempt['status'], ProctoredExamStudentAttemptStatus.resumed)
+
+    @ddt.data(
+        (
+            ProctoredExamStudentAttemptStatus.started,
+            ProctoredExamStudentAttemptStatus.error,
+            True
+        ),
+        (
+            ProctoredExamStudentAttemptStatus.started,
+            ProctoredExamStudentAttemptStatus.ready_to_submit,
+            False
+        ),
+        (
+            ProctoredExamStudentAttemptStatus.error,
+            ProctoredExamStudentAttemptStatus.ready_to_resume,
+            False
+        ),
+        (
+            ProctoredExamStudentAttemptStatus.ready_to_resume,
+            ProctoredExamStudentAttemptStatus.resumed,
+            False
+        ),
+        (
+            ProctoredExamStudentAttemptStatus.error,
+            ProctoredExamStudentAttemptStatus.verified,
+            True
+        ),
+        (
+            ProctoredExamStudentAttemptStatus.error,
+            ProctoredExamStudentAttemptStatus.second_review_required,
+            True
+        ),
+        (
+            ProctoredExamStudentAttemptStatus.error,
+            ProctoredExamStudentAttemptStatus.rejected,
+            True
+        ),
+    )
+    @ddt.unpack
+    def test_exam_attempt_is_resumable(self, from_status, to_status, expected_is_resumable):
+        exam_attempt = self._create_exam_attempt(self.proctored_exam_id, status=from_status)
+        if from_status == ProctoredExamStudentAttemptStatus.error:
+            self.assertTrue(exam_attempt.is_resumable)
+        else:
+            self.assertFalse(exam_attempt.is_resumable)
+
+        update_attempt_status(
+            exam_attempt.id,
+            to_status,
+        )
+        attempt = get_exam_attempt_by_id(exam_attempt.id)
+        self.assertEqual(attempt['is_resumable'], expected_is_resumable)
 
     def test_requirement_status_order(self):
         """
@@ -2136,9 +2884,9 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
         assert get_exam_attempt_by_id(attempt_id)['status'] == ProctoredExamStudentAttemptStatus.onboarding_missing
 
         # now create the practice attempt
-        create_exam_attempt(self.onboarding_exam_id, self.user_id)
+        onboarding_attempt_id = create_exam_attempt(self.onboarding_exam_id, self.user_id)
         # and move the status to verified
-        update_attempt_status(self.onboarding_exam_id, self.user_id, ProctoredExamStudentAttemptStatus.verified)
+        update_attempt_status(onboarding_attempt_id, ProctoredExamStudentAttemptStatus.verified)
         # now the original attempt will be deleted
         assert get_exam_attempt_by_id(attempt_id) is None
         # ensure that the attempt is still in the history table
@@ -2157,3 +2905,662 @@ class ProctoredExamApiTests(ProctoredExamTestCase):
 
         del test_backend.integration_specific_email
         assert get_integration_specific_email(test_backend) == DEFAULT_CONTACT_EMAIL
+
+    def test_get_enrollments_can_take_proctored_exams(self):
+        enrollments = [
+            {
+                'user': 'user_1',
+                'mode': 'verified',
+            },
+            {
+                'user': 'user_2',
+                'mode': 'masters',
+            },
+            {
+                'user': 'user_3',
+                'mode': 'executive-education',
+            },
+        ]
+        expected_enrollments = [(enrollment['user'], enrollment['mode']) for enrollment in enrollments]
+
+        with patch(
+                'edx_proctoring.tests.test_services.MockEnrollmentsService.get_enrollments_can_take_proctored_exams',
+                return_value=expected_enrollments
+        ):
+            set_runtime_service('enrollments', MockEnrollmentsService(enrollments))
+            self.assertEqual(expected_enrollments, get_enrollments_can_take_proctored_exams('course_id'))
+
+    @ddt.data(
+        (ProctoredExamStudentAttemptStatus.verified, ProctoredExamStudentAttemptStatus.declined, True),
+        (ProctoredExamStudentAttemptStatus.verified, ProctoredExamStudentAttemptStatus.started, True),
+        (ProctoredExamStudentAttemptStatus.verified, ProctoredExamStudentAttemptStatus.submitted, True),
+        (ProctoredExamStudentAttemptStatus.verified, ProctoredExamStudentAttemptStatus.error, True),
+        (ProctoredExamStudentAttemptStatus.verified, ProctoredExamStudentAttemptStatus.rejected, True),
+        (ProctoredExamStudentAttemptStatus.verified, ProctoredExamStudentAttemptStatus.verified, True),
+        (ProctoredExamStudentAttemptStatus.rejected, ProctoredExamStudentAttemptStatus.declined, True),
+        (ProctoredExamStudentAttemptStatus.rejected, ProctoredExamStudentAttemptStatus.started, True),
+        (ProctoredExamStudentAttemptStatus.rejected, ProctoredExamStudentAttemptStatus.submitted, True),
+        (ProctoredExamStudentAttemptStatus.rejected, ProctoredExamStudentAttemptStatus.error, True),
+        (ProctoredExamStudentAttemptStatus.rejected, ProctoredExamStudentAttemptStatus.rejected, True),
+        (ProctoredExamStudentAttemptStatus.rejected, ProctoredExamStudentAttemptStatus.verified, True),
+        (ProctoredExamStudentAttemptStatus.verified, ProctoredExamStudentAttemptStatus.declined, False),
+        (ProctoredExamStudentAttemptStatus.verified, ProctoredExamStudentAttemptStatus.started, False),
+        (ProctoredExamStudentAttemptStatus.verified, ProctoredExamStudentAttemptStatus.submitted, False),
+        (ProctoredExamStudentAttemptStatus.verified, ProctoredExamStudentAttemptStatus.error, False),
+        (ProctoredExamStudentAttemptStatus.verified, ProctoredExamStudentAttemptStatus.rejected, False),
+        (ProctoredExamStudentAttemptStatus.verified, ProctoredExamStudentAttemptStatus.verified, False),
+        (ProctoredExamStudentAttemptStatus.rejected, ProctoredExamStudentAttemptStatus.declined, False),
+        (ProctoredExamStudentAttemptStatus.rejected, ProctoredExamStudentAttemptStatus.started, False),
+        (ProctoredExamStudentAttemptStatus.rejected, ProctoredExamStudentAttemptStatus.submitted, False),
+        (ProctoredExamStudentAttemptStatus.rejected, ProctoredExamStudentAttemptStatus.error, False),
+        (ProctoredExamStudentAttemptStatus.rejected, ProctoredExamStudentAttemptStatus.rejected, False),
+        (ProctoredExamStudentAttemptStatus.rejected, ProctoredExamStudentAttemptStatus.verified, False),
+    )
+    @ddt.unpack  # pylint: disable=too-many-statements
+    def test_grade_certificate_release_with_multiple_attempts(
+        self,
+        first_attempt_status,
+        second_attempt_status,
+        update_in_order
+    ):
+        set_runtime_service('grades', MockGradesService())
+
+        # create attempt
+        first_attempt_id = create_exam_attempt(self.proctored_exam_id, self.user_id, taking_as_proctored=True)
+        # move to ready to resume
+        update_attempt_status(first_attempt_id, ProctoredExamStudentAttemptStatus.error)
+        update_attempt_status(first_attempt_id, ProctoredExamStudentAttemptStatus.ready_to_resume)
+        # check that status has been updated
+        self.assertEqual(
+            get_exam_attempt_by_id(first_attempt_id)['status'],
+            ProctoredExamStudentAttemptStatus.ready_to_resume
+        )
+        # create second attempt
+        second_attempt_id = create_exam_attempt(self.proctored_exam_id, self.user_id, taking_as_proctored=True)
+        # check that status has been updated
+        self.assertEqual(
+            get_exam_attempt_by_id(second_attempt_id)['status'],
+            ProctoredExamStudentAttemptStatus.created
+        )
+        self.assertEqual(
+            get_exam_attempt_by_id(first_attempt_id)['status'],
+            ProctoredExamStudentAttemptStatus.resumed
+        )
+
+        if update_in_order:
+            updating_first = {'id': first_attempt_id, 'status': first_attempt_status}
+            updating_second = {'id': second_attempt_id, 'status': second_attempt_status}
+        else:
+            updating_first = {'id': second_attempt_id, 'status': second_attempt_status}
+            updating_second = {'id': first_attempt_id, 'status': first_attempt_status}
+
+        credit_service = get_runtime_service('credit')
+        grades_service = get_runtime_service('grades')
+        course_id = get_exam_attempt_by_id(first_attempt_id)['proctored_exam']['course_id']
+        content_id = get_exam_attempt_by_id(first_attempt_id)['proctored_exam']['content_id']
+
+        grades_service.init_grade(
+            user_id=self.user.id,
+            course_key_or_id=course_id,
+            usage_key_or_id=content_id,
+            earned_all=5.0,
+            earned_graded=5.0
+        )
+
+        # check initial credit status
+        credit_status = credit_service.get_credit_state(self.user.id, course_id)
+        self.assertEqual(len(credit_status['credit_requirement_status']), 1)
+        self.assertEqual(
+            credit_status['credit_requirement_status'][0]['status'],
+            'failed'
+        )
+
+        # run first update
+        update_attempt_status(updating_first['id'], updating_first['status'])
+
+        # check that credit and emails have been sent if appropriate
+        if updating_first['status'] == ProctoredExamStudentAttemptStatus.rejected:
+            credit_status = credit_service.get_credit_state(self.user.id, course_id)
+            self.assertEqual(len(credit_status['credit_requirement_status']), 1)
+            self.assertEqual(
+                credit_status['credit_requirement_status'][0]['status'],
+                'failed'
+            )
+            self.assertEqual(len(mail.outbox), 1)
+        elif updating_first['status'] == ProctoredExamStudentAttemptStatus.submitted:
+            credit_status = credit_service.get_credit_state(self.user.id, course_id)
+            self.assertEqual(len(credit_status['credit_requirement_status']), 1)
+            self.assertEqual(
+                credit_status['credit_requirement_status'][0]['status'],
+                'submitted'
+            )
+            self.assertEqual(len(mail.outbox), 1)
+        elif updating_first['status'] == ProctoredExamStudentAttemptStatus.error:
+            credit_status = credit_service.get_credit_state(self.user.id, course_id)
+            self.assertEqual(len(credit_status['credit_requirement_status']), 1)
+            self.assertEqual(
+                credit_status['credit_requirement_status'][0]['status'],
+                'failed'
+            )
+            self.assertEqual(len(mail.outbox), 0)
+        elif updating_first['status'] == ProctoredExamStudentAttemptStatus.declined:
+            credit_status = credit_service.get_credit_state(self.user.id, course_id)
+            self.assertEqual(len(credit_status['credit_requirement_status']), 1)
+            self.assertEqual(
+                credit_status['credit_requirement_status'][0]['status'],
+                'declined'
+            )
+            self.assertEqual(len(mail.outbox), 0)
+        else:
+            credit_status = credit_service.get_credit_state(self.user.id, course_id)
+            self.assertEqual(len(credit_status['credit_requirement_status']), 1)
+            self.assertEqual(
+                credit_status['credit_requirement_status'][0]['status'],
+                'failed'
+            )
+            self.assertEqual(len(mail.outbox), 0)
+
+        # run second update
+        update_attempt_status(updating_second['id'], updating_second['status'])
+
+        # check that credit an emails have been sent when appropriate
+        if 'declined' in [updating_first['status'], updating_second['status']]:
+            credit_status = credit_service.get_credit_state(self.user.id, course_id)
+            self.assertEqual(len(credit_status['credit_requirement_status']), 1)
+            self.assertEqual(
+                credit_status['credit_requirement_status'][0]['status'],
+                'declined'
+            )
+            if 'rejected' in [updating_first['status'], updating_second['status']]:
+                assert len(mail.outbox) <= 1
+            else:
+                self.assertEqual(len(mail.outbox), 0)
+        elif (
+            'submitted' in [updating_first['status'], updating_second['status']] and
+            'rejected' in [updating_first['status'], updating_second['status']]
+        ):
+            credit_status = credit_service.get_credit_state(self.user.id, course_id)
+            self.assertEqual(len(credit_status['credit_requirement_status']), 1)
+            self.assertEqual(
+                credit_status['credit_requirement_status'][0]['status'],
+                'failed'
+            )
+            # possible to  have both submitted and rejected email if submitted came first
+            assert 2 >= len(mail.outbox) >= 1
+        elif (
+            'declined' not in [updating_first['status'], updating_second['status']] and
+            'rejected' in [updating_first['status'], updating_second['status']]
+        ):
+            credit_status = credit_service.get_credit_state(self.user.id, course_id)
+            self.assertEqual(len(credit_status['credit_requirement_status']), 1)
+            self.assertEqual(
+                credit_status['credit_requirement_status'][0]['status'],
+                'failed'
+            )
+            self.assertEqual(len(mail.outbox), 1)
+        elif (
+            'rejected' not in [updating_first['status'], updating_second['status']] and
+            'submitted' in [updating_first['status'], updating_second['status']]
+        ):
+            credit_status = credit_service.get_credit_state(self.user.id, course_id)
+            self.assertEqual(len(credit_status['credit_requirement_status']), 1)
+            self.assertEqual(
+                credit_status['credit_requirement_status'][0]['status'],
+                'submitted'
+            )
+            # possible to have both submitted and verified emails
+            assert 2 >= len(mail.outbox) >= 1
+        elif (
+            'rejected' not in [updating_first['status'], updating_second['status']] and
+            'error' in [updating_first['status'], updating_second['status']]
+        ):
+            credit_status = credit_service.get_credit_state(self.user.id, course_id)
+            self.assertEqual(len(credit_status['credit_requirement_status']), 1)
+            self.assertEqual(
+                credit_status['credit_requirement_status'][0]['status'],
+                'failed'
+            )
+            self.assertEqual(len(mail.outbox), 0)
+        elif [updating_first['status'], updating_second['status']].count('verified') == 2:
+            credit_status = credit_service.get_credit_state(self.user.id, course_id)
+            self.assertEqual(len(credit_status['credit_requirement_status']), 1)
+            self.assertEqual(
+                credit_status['credit_requirement_status'][0]['status'],
+                'satisfied'
+            )
+            self.assertEqual(len(mail.outbox), 1)
+
+        # check for grade override
+        override = grades_service.get_subsection_grade_override(
+            user_id=self.user.id,
+            course_key_or_id=course_id,
+            usage_key_or_id=content_id
+        )
+        # rejected will not override declined
+        if (
+            'rejected' in [updating_first['status'], updating_second['status']] and
+            updating_first['status'] != 'declined'
+        ):
+            self.assertDictEqual({
+                'earned_all': override.earned_all_override,
+                'earned_graded': override.earned_graded_override
+            }, {
+                'earned_all': 0.0,
+                'earned_graded': 0.0
+            })
+        else:
+            self.assertEqual(override, None)
+
+
+@ddt.ddt
+class LastVerifiedOnboardingAttemptsTests(ProctoredExamTestCase):
+    """
+    This is the test case for the API function get_last_verified_onboarding_attempts_per_user
+    """
+    def setUp(self):
+        super().setUp()
+        self.onboarding_exam_id = self._create_onboarding_exam()
+        self.other_course_id = 'e/f/g'
+        self.other_course_onboarding_content_id = 'block-v1:test+course+2+type@sequential+block@other_onboard'
+        self.other_onboarding_exam_name = 'other_test_onboarding_exam_name'
+        self.other_onboarding_exam_id = create_exam(
+            course_id=self.other_course_id,
+            content_id=self.other_course_onboarding_content_id,
+            exam_name=self.other_onboarding_exam_name,
+            time_limit_mins=self.default_time_limit,
+            is_practice_exam=True,
+            is_proctored=True,
+            backend='test',
+        )
+
+    def _setup_onboarding_attempts(self, exam_id, users, status):
+        """
+        Setup the onboarding attempt according to the user and status passed in
+        """
+        for user in users:
+            this_course_onboarding_attempt_id = create_exam_attempt(
+                exam_id,
+                user.id,
+                taking_as_proctored=True
+            )
+            update_attempt_status(
+                this_course_onboarding_attempt_id,
+                status,
+            )
+
+    def _assert_verified_attempts(self, users, attempts_dictionary):
+        """
+        Assert to verify onboarding attempts based on users list passed in
+        """
+        for user in users:
+            attempt = attempts_dictionary.get(user.id)
+            self.assertIsNotNone(attempt)
+            self.assertEqual(attempt.status, ProctoredExamStudentAttemptStatus.verified)
+
+    @ddt.data(True, False)
+    def test_all_verified(self, setup_current_course):
+        users_list = self.create_batch_users(6)
+
+        if setup_current_course:
+            self._setup_onboarding_attempts(
+                self.onboarding_exam_id,
+                users_list,
+                ProctoredExamStudentAttemptStatus.submitted,
+            )
+
+        self._setup_onboarding_attempts(
+            self.other_onboarding_exam_id,
+            users_list,
+            ProctoredExamStudentAttemptStatus.verified,
+        )
+
+        all_onboarding_attempts_dictionary = get_last_verified_onboarding_attempts_per_user(
+            users_list,
+            'test',
+        )
+        self.assertEqual(6, len(all_onboarding_attempts_dictionary.items()))
+        self._assert_verified_attempts(users_list, all_onboarding_attempts_dictionary)
+
+    @ddt.data(True, False)
+    def test_some_verified(self, setup_current_course):
+        all_users = self.create_batch_users(8)
+        verified_users_list = all_users[0:5]
+
+        if setup_current_course:
+            self._setup_onboarding_attempts(
+                self.onboarding_exam_id,
+                all_users,
+                ProctoredExamStudentAttemptStatus.submitted,
+            )
+
+        self._setup_onboarding_attempts(
+            self.other_onboarding_exam_id,
+            verified_users_list,
+            ProctoredExamStudentAttemptStatus.verified,
+        )
+
+        all_onboarding_attempts_dictionary = get_last_verified_onboarding_attempts_per_user(
+            all_users,
+            'test',
+        )
+        self.assertEqual(5, len(all_onboarding_attempts_dictionary.items()))
+        self._assert_verified_attempts(verified_users_list, all_onboarding_attempts_dictionary)
+
+    def test_multiple_verified(self):
+        all_users = self.create_batch_users(8)
+        verified_users_list = all_users[0:5]
+        with freeze_time(datetime.now(pytz.UTC) - timedelta(days=30)):
+            self._setup_onboarding_attempts(
+                self.onboarding_exam_id,
+                all_users,
+                ProctoredExamStudentAttemptStatus.verified,
+            )
+
+        self._setup_onboarding_attempts(
+            self.other_onboarding_exam_id,
+            verified_users_list,
+            ProctoredExamStudentAttemptStatus.verified,
+        )
+
+        all_onboarding_attempts_dictionary = get_last_verified_onboarding_attempts_per_user(
+            all_users,
+            'test',
+        )
+        self.assertEqual(8, len(all_onboarding_attempts_dictionary.items()))
+        for user in verified_users_list:
+            attempt = all_onboarding_attempts_dictionary.get(user.id)
+            self.assertEqual(attempt.status, ProctoredExamStudentAttemptStatus.verified)
+            self.assertLessEqual(datetime.now(pytz.UTC) - timedelta(days=26), attempt.modified)
+
+        for user in all_users[5:]:
+            attempt = all_onboarding_attempts_dictionary.get(user.id)
+            self.assertEqual(attempt.status, ProctoredExamStudentAttemptStatus.verified)
+            self.assertGreater(datetime.now(pytz.UTC) - timedelta(days=26), attempt.modified)
+
+    @ddt.data(True, False)
+    def test_no_verified(self, setup_current_course):
+        all_users = self.create_batch_users(5)
+        if setup_current_course:
+            self._setup_onboarding_attempts(
+                self.onboarding_exam_id,
+                all_users,
+                ProctoredExamStudentAttemptStatus.started,
+            )
+        attempts_dict = get_last_verified_onboarding_attempts_per_user(
+            all_users,
+            'test',
+        )
+        self.assertEqual(0, len(attempts_dict.items()))
+
+    @ddt.data(True, False)
+    def test_expired(self, setup_current_course):
+        all_users = self.create_batch_users(5)
+
+        if setup_current_course:
+            self._setup_onboarding_attempts(
+                self.onboarding_exam_id,
+                all_users,
+                ProctoredExamStudentAttemptStatus.started,
+            )
+
+        with freeze_time(datetime.now(pytz.UTC) - timedelta(days=735)):
+            self._setup_onboarding_attempts(
+                self.other_onboarding_exam_id,
+                all_users,
+                ProctoredExamStudentAttemptStatus.verified,
+            )
+
+        attempts_dict = get_last_verified_onboarding_attempts_per_user(
+            all_users,
+            'test',
+        )
+        self.assertEqual(0, len(attempts_dict.items()))
+
+    @ddt.data(True, False)
+    def test_more_courses(self, setup_current_course):
+        all_users = self.create_batch_users(10)
+        if setup_current_course:
+            self._setup_onboarding_attempts(
+                self.onboarding_exam_id,
+                all_users,
+                ProctoredExamStudentAttemptStatus.started,
+            )
+
+        third_course_id = 'o/p/q'
+        third_course_onboarding_content_id = 'block-v1:test+course+3+type@sequential+block@third_onboard'
+        third_onboarding_exam_name = 'third_test_onboarding_exam_name'
+        third_onboarding_exam_id = create_exam(
+            course_id=third_course_id,
+            content_id=third_course_onboarding_content_id,
+            exam_name=third_onboarding_exam_name,
+            time_limit_mins=self.default_time_limit,
+            is_practice_exam=True,
+            is_proctored=True,
+            backend='test',
+        )
+
+        third_course_verified = all_users[6:]
+
+        self._setup_onboarding_attempts(
+            self.other_onboarding_exam_id,
+            all_users[0:5],
+            ProctoredExamStudentAttemptStatus.verified,
+        )
+
+        self._setup_onboarding_attempts(
+            third_onboarding_exam_id,
+            third_course_verified,
+            ProctoredExamStudentAttemptStatus.verified
+        )
+
+        attempts_dict = get_last_verified_onboarding_attempts_per_user(
+            all_users,
+            'test',
+        )
+        self.assertEqual(9, len(attempts_dict.items()))
+        self._assert_verified_attempts(all_users[0:5], attempts_dict)
+        self._assert_verified_attempts(third_course_verified, attempts_dict)
+
+
+@ddt.ddt
+class GetExamAttemptDataTests(ProctoredExamTestCase):
+    """
+    Tests for get_exam_attempt_data.
+    """
+    def setUp(self):
+        """
+        Initialize
+        """
+        super().setUp()
+        self.timed_exam_id = self._create_timed_exam()
+        self.proctored_exam_id = self._create_proctored_exam()
+
+    @ddt.data(
+        (True, False),
+        (True, True),
+        (False, False),
+        (False, True),
+    )
+    @ddt.unpack
+    @override_settings(LEARNING_MICROFRONTEND_URL='http://learningmfe')
+    def test_get_exam_attempt_data(self, is_proctored_exam, is_learning_mfe):
+        """ Test expected attempt data returned by get_exam_attempt_data. """
+        attempt = self._create_started_exam_attempt(is_proctored=is_proctored_exam)
+        exam_id = self.timed_exam_id if not is_proctored_exam else self.proctored_exam_id
+        attempt_data = get_exam_attempt_data(exam_id, attempt.id, is_learning_mfe)
+        content_id = self.content_id if is_proctored_exam else self.content_id_timed
+        expected_exam_url = '{}/course/{}/{}'.format(
+            settings.LEARNING_MICROFRONTEND_URL, self.course_id, content_id
+        ) if is_learning_mfe else reverse('jump_to', args=[self.course_id, content_id])
+
+        assert attempt_data
+        assert 'attempt_id' in attempt_data
+        assert attempt_data['attempt_id'] == attempt.id
+        assert 'exam_url_path' in attempt_data
+        assert attempt_data['exam_url_path'] == expected_exam_url
+
+    @ddt.data(
+        (True, True, 'an onboarding exam'),
+        (True, False, 'a proctored exam'),
+        (False, False, 'a timed exam')
+    )
+    @ddt.unpack
+    def test_exam_type(self, is_proctored, is_practice, expected_exam_type):
+        """
+        Testing the exam type
+        """
+        self._test_exam_type(is_proctored, is_practice, expected_exam_type)
+
+    def _test_exam_type(self, is_proctored, is_practice, expected_exam_type):
+        """
+        Testing the exam type
+        """
+        proctored_exam = ProctoredExam.objects.create(
+            course_id='a/b/c',
+            content_id='test_content',
+            exam_name='Test Exam',
+            external_id='123aXqe3',
+            time_limit_mins=90,
+            is_proctored=is_proctored,
+            is_practice_exam=is_practice
+        )
+
+        attempt = ProctoredExamStudentAttempt.objects.create(
+            proctored_exam=proctored_exam,
+            user=self.user,
+            allowed_time_limit_mins=90,
+            taking_as_proctored=is_proctored,
+            is_sample_attempt=is_practice,
+            external_id=proctored_exam.external_id,
+            status=ProctoredExamStudentAttemptStatus.started
+        )
+
+        data = get_exam_attempt_data(proctored_exam.id, attempt.id)
+        self.assertEqual(data['exam_type'], expected_exam_type)
+
+    def test_practice_exam_type(self):
+        """
+        Test practice exam type with short special setup and teardown
+        """
+        test_backend = get_backend_provider(name='test')
+        previous_value = test_backend.supports_onboarding
+        test_backend.supports_onboarding = False
+        self._test_exam_type(True, True, 'a practice exam')
+        test_backend.supports_onboarding = previous_value
+
+    @ddt.data(True, False)
+    def test_get_exam_attempt(self, is_proctored):
+        """
+        Test Case for retrieving student proctored exam attempt status.
+        """
+        # Create an exam.
+        proctored_exam = ProctoredExam.objects.create(
+            course_id='a/b/c',
+            content_id='test_content',
+            exam_name='Test Exam',
+            external_id='123aXqe3',
+            time_limit_mins=90,
+            is_proctored=is_proctored
+        )
+
+        attempt_data = {
+            'exam_id': proctored_exam.id,
+            'user_id': self.user.id,
+            'external_id': proctored_exam.external_id,
+            'attempt_proctored': is_proctored,
+            'start_clock': True
+        }
+        response = self.client.post(
+            reverse('edx_proctoring:proctored_exam.attempt.collection'),
+            attempt_data
+        )
+        self.assertEqual(response.status_code, 200)
+        response_data = response.json()
+
+        data = get_exam_attempt_data(proctored_exam.id, response_data['exam_attempt_id'])
+        self.assertEqual(data['exam_display_name'], 'Test Exam')
+        self.assertEqual(data['low_threshold_sec'], 1080)
+        self.assertEqual(data['critically_low_threshold_sec'], 270)
+        # make sure we have the accessible human string
+        self.assertEqual(data['accessibility_time_string'], 'you have 1 hour and 30 minutes remaining')
+
+    def test_get_exam_attempt_has_total_time_if_status_is_ready_to_resume(self):
+        """
+        Test Case that exam attempt data contains total_time when exam attempt is in ready_to_resume status.
+        """
+        proctored_exam = ProctoredExam.objects.create(
+            course_id='a/b/c',
+            content_id='test_content',
+            exam_name='Test Exam',
+            external_id='123aXqe3',
+            time_limit_mins=90,
+            is_proctored=True,
+        )
+
+        attempt = ProctoredExamStudentAttempt.objects.create(
+            proctored_exam=proctored_exam,
+            user=self.user,
+            allowed_time_limit_mins=90,
+            taking_as_proctored=True,
+            is_sample_attempt=False,
+            external_id=proctored_exam.external_id,
+            status=ProctoredExamStudentAttemptStatus.ready_to_resume
+        )
+
+        data = get_exam_attempt_data(proctored_exam.id, attempt.id)
+        self.assertEqual(data['total_time'], '1 hour and 30 minutes')
+
+
+@ddt.ddt
+class CheckPrerequisitesTests(ProctoredExamTestCase):
+    """
+    Tests for check_prerequisites.
+    """
+    def setUp(self):
+        """
+        Initialize
+        """
+        super().setUp()
+        self.proctored_exam_id = self._create_proctored_exam()
+        self.exam = {
+            'id': self.proctored_exam_id,
+            'course_id': self.course_id,
+            'content_id': self.content_id
+        }
+
+    @ddt.data(
+        ('pending', False, 1),
+        ('failed', False, 1),
+        ('satisfied', True, 2),
+        ('declined', False, 1),
+    )
+    @ddt.unpack
+    def test_check_prerequisites(self, status, are_satisfied, expected_prerequisites_len):
+        """
+        Testing that prerequisites are checked correctly
+        """
+        if status == 'declined':
+            prerequisites = self.declined_prerequisites
+        else:
+            prerequisites = [item for item in self.prerequisites if item['status'] == status]
+        with patch(
+                'edx_proctoring.tests.test_services.MockCreditService.get_credit_state',
+                return_value={'credit_requirement_status': prerequisites}
+        ):
+            result = check_prerequisites(self.exam, self.user_id)
+            self.assertEqual(result['prerequisite_status']['are_prerequisites_satisifed'], are_satisfied)
+            self.assertEqual(
+                len(result['prerequisite_status']['{}_prerequisites'.format(status)]),
+                expected_prerequisites_len
+            )
+            if status == 'declined':
+                attempt = get_current_exam_attempt(self.exam['id'], self.user_id)
+                self.assertEqual(attempt['status'], ProctoredExamStudentAttemptStatus.declined)
+
+    def test_check_prerequisites_with_no_credit_state(self):
+        """
+        Testing that prerequisites are not checked if we do not have credit state
+        """
+        set_runtime_service('credit', MockCreditServiceNone())
+        result = check_prerequisites(self.exam, self.user_id)
+        self.assertDictEqual(self.exam, result)

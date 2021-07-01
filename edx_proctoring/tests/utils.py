@@ -13,17 +13,18 @@ from eventtracking import tracker
 from eventtracking.tracker import TRACKERS, Tracker
 
 from django.conf import settings
-from django.contrib.auth import login
-from django.contrib.auth.models import User
+from django.contrib.auth import get_user_model, login
 from django.http import HttpRequest
 from django.test import TestCase
 from django.test.client import Client
 
-from edx_proctoring.api import create_exam
+from edx_proctoring.api import create_exam, create_exam_review_policy
 from edx_proctoring.models import ProctoredExamStudentAttempt
 from edx_proctoring.runtime import set_runtime_service
 from edx_proctoring.statuses import ProctoredExamStudentAttemptStatus
 from edx_proctoring.tests.test_services import MockCreditService, MockInstructorService
+
+User = get_user_model()
 
 
 class TestClient(Client):
@@ -71,11 +72,25 @@ class LoggedInTestCase(TestCase):
         """
         Setup for tests
         """
-        super(LoggedInTestCase, self).setUp()
+        super().setUp()
         self.client = TestClient()
         self.user = User(username='tester', email='tester@test.com')
         self.user.save()
         self.client.login_user(self.user)
+
+    def create_batch_users(self, batch_size):
+        """
+        Help create a bunch of users for testing
+        """
+        users_list = []
+        for i in range(batch_size):
+            created_user = User(
+                username='student' + str(i),
+                email='student{}@test.com'.format(i),
+            )
+            created_user.save()
+            users_list.append(created_user)
+        return users_list
 
 
 class MockTracker(Tracker):
@@ -97,25 +112,20 @@ class ProctoredExamTestCase(LoggedInTestCase):
         """
         Build out test harnessing
         """
-        super(ProctoredExamTestCase, self).setUp()
+        super().setUp()
         self.default_time_limit = 21
         self.course_id = 'a/b/c'
         self.content_id_for_exam_with_due_date = 'test_content_due_date_id'
-        self.content_id = 'test_content_id'
-        self.content_id_timed = 'test_content_id_timed'
-        self.content_id_practice = 'test_content_id_practice'
-        self.content_id_onboarding = 'test_content_id_onboarding'
-        self.disabled_content_id = 'test_disabled_content_id'
+        self.content_id = 'block-v1:test+course+1+type@sequential+block@exam'
+        self.content_id_timed = 'block-v1:test+course+1+type@sequential+block@timed'
+        self.content_id_practice = 'block-v1:test+course+1+type@sequential+block@practice'
+        self.content_id_onboarding = 'block-v1:test+course+1+type@sequential+block@onboard'
+        self.disabled_content_id = 'block-v1:test+course+1+type@sequential+block@disabled'
         self.exam_name = 'Test Exam'
         self.user_id = self.user.id
         self.key = 'additional_time_granted'
         self.value = '10'
         self.external_id = 'test_external_id'
-        self.proctored_exam_id = self._create_proctored_exam()
-        self.timed_exam_id = self._create_timed_exam()
-        self.practice_exam_id = self._create_practice_exam()
-        self.onboarding_exam_id = self._create_onboarding_exam()
-        self.disabled_exam_id = self._create_disabled_exam()
 
         set_runtime_service('credit', MockCreditService())
         set_runtime_service('instructor', MockInstructorService(is_user_course_staff=True))
@@ -192,7 +202,7 @@ class ProctoredExamTestCase(LoggedInTestCase):
         """
         Cleanup
         """
-        super(ProctoredExamTestCase, self).tearDown()
+        super().tearDown()
         del TRACKERS['default']
 
     def _create_proctored_exam(self):
@@ -274,7 +284,8 @@ class ProctoredExamTestCase(LoggedInTestCase):
             is_active=False
         )
 
-    def _create_exam_attempt(self, exam_id, status=ProctoredExamStudentAttemptStatus.created):
+    def _create_exam_attempt(self, exam_id, status=ProctoredExamStudentAttemptStatus.created,
+                             is_practice_exam=False, time_remaining_seconds=None):
         """
         Creates the ProctoredExamStudentAttempt object.
         """
@@ -285,6 +296,8 @@ class ProctoredExamTestCase(LoggedInTestCase):
             status=status,
             allowed_time_limit_mins=10,
             taking_as_proctored=True,
+            is_sample_attempt=is_practice_exam,
+            time_remaining_seconds=time_remaining_seconds,
         )
 
         if status in (ProctoredExamStudentAttemptStatus.started,
@@ -294,6 +307,9 @@ class ProctoredExamTestCase(LoggedInTestCase):
         if ProctoredExamStudentAttemptStatus.is_completed_status(status):
             attempt.completed_at = datetime.now(pytz.UTC)
 
+        if status == ProctoredExamStudentAttemptStatus.error:
+            attempt.is_resumable = True
+
         attempt.save()
 
         return attempt
@@ -302,7 +318,7 @@ class ProctoredExamTestCase(LoggedInTestCase):
         """
         Create onboarding attempt
         """
-        return self._create_exam_attempt(self.onboarding_exam_id)
+        return self._create_exam_attempt(self.onboarding_exam_id, is_practice_exam=True)
 
     def _create_unstarted_exam_attempt(self, is_proctored=True, is_practice=False):
         """
@@ -346,6 +362,31 @@ class ProctoredExamTestCase(LoggedInTestCase):
             is_sample_attempt=True,
             status=ProctoredExamStudentAttemptStatus.started,
             allowed_time_limit_mins=10
+        )
+
+    def _create_started_onboarding_exam_attempt(self, started_at=None):
+        """
+        Creates the ProctoredExamStudentAttempt object.
+        """
+        return ProctoredExamStudentAttempt.objects.create(
+            proctored_exam_id=self.onboarding_exam_id,
+            taking_as_proctored=True,
+            user_id=self.user_id,
+            external_id=self.external_id,
+            started_at=started_at if started_at else datetime.now(pytz.UTC),
+            is_sample_attempt=True,
+            status=ProctoredExamStudentAttemptStatus.started,
+            allowed_time_limit_mins=10
+        )
+
+    def _create_review_policy(self, exam_id):
+        """
+        Calls the api's create_exam_review_policy to create an exam review policy object.
+        """
+        return create_exam_review_policy(
+            exam_id,
+            self.user.id,
+            "This is a test review policy."
         )
 
     @staticmethod

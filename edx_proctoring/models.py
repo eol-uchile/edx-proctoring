@@ -6,6 +6,9 @@ Data models for the proctoring subsystem
 # pylint: disable=model-missing-unicode
 
 
+from datetime import datetime, timedelta
+
+import pytz
 from model_utils.models import TimeStampedModel
 
 from django.contrib.auth import get_user_model
@@ -15,6 +18,7 @@ from django.db.models.base import ObjectDoesNotExist
 from django.utils.translation import ugettext_noop
 
 from edx_proctoring.backends import get_backend_provider
+from edx_proctoring.constants import VERIFICATION_DAYS_VALID
 from edx_proctoring.exceptions import (
     AllowanceValueNotAllowedException,
     ProctoredExamNotActiveException,
@@ -117,6 +121,21 @@ class ProctoredExam(TimeStampedModel):
 
         return cls.objects.filter(filtered_query)
 
+    @classmethod
+    def get_practice_proctored_exams_for_course(cls, course_id):
+        """
+        Return all practice proctored exams for a course.
+
+        Arguments
+        * course_id: course ID of the course
+        """
+        return cls.objects.filter(
+            course_id=course_id,
+            is_active=True,
+            is_practice_exam=True,
+            is_proctored=True
+        )
+
 
 class ProctoredExamReviewPolicy(TimeStampedModel):
     """
@@ -185,7 +204,7 @@ class ProctoredExamReviewPolicyHistory(TimeStampedModel):
         db_table = 'proctoring_proctoredexamreviewpolicyhistory'
         verbose_name = 'proctored exam review policy history'
 
-    def delete(self, *args, **kwargs):  # pylint: disable=arguments-differ
+    def delete(self, *args, **kwargs):  # pylint: disable=signature-differs
         """
         Don't allow deletions!
         """
@@ -196,13 +215,15 @@ class ProctoredExamStudentAttemptManager(models.Manager):
     """
     Custom manager
     """
-    def get_exam_attempt(self, exam_id, user_id):
+    def get_current_exam_attempt(self, exam_id, user_id):
         """
-        Returns the Student Exam Attempt object if found
+        Returns the most recent Student Exam Attempt object if found
         else Returns None.
         """
         try:
-            exam_attempt_obj = self.get(proctored_exam_id=exam_id, user_id=user_id)  # pylint: disable=no-member
+            exam_attempt_obj = self.filter(
+                proctored_exam_id=exam_id, user_id=user_id
+            ).latest('created')  # pylint: disable=no-member
         except ObjectDoesNotExist:  # pylint: disable=no-member
             exam_attempt_obj = None
         return exam_attempt_obj
@@ -246,11 +267,55 @@ class ProctoredExamStudentAttemptManager(models.Manager):
         filtered_query = Q(proctored_exam__course_id=course_id)
         return self.filter(filtered_query).order_by('-created')  # pylint: disable=no-member
 
+    def get_all_exam_attempts_by_exam_id(self, exam_id):
+        """
+        Returns all the exam attempts in an exam with the given exam ID.
+
+        Parameters:
+        * exam_id: ID of the exam
+        """
+        return self.filter(proctored_exam_id=exam_id)
+
+    # pylint: disable=invalid-name
+    def get_proctored_practice_attempts_by_course_id(self, course_id, users=None):
+        """
+        Returns all proctored practice attempts for a course, ordered by descending modified field.
+
+        Parameters:
+        * course_id: ID of the course
+        * users (optional): an iterable of users to filter by
+        """
+        queryset = self.get_all_exam_attempts(course_id).filter(
+            proctored_exam__is_practice_exam=True,
+            proctored_exam__is_active=True,
+            taking_as_proctored=True
+        ).order_by('-modified')
+        if users:
+            queryset = queryset.filter(user__in=users)
+        return queryset
+
+    def get_last_verified_proctored_onboarding_attempts(self, users, proctoring_backend):
+        """
+        Returns the last verified proctored onboarding attempt for a specific backend for passed in users list,
+        if attempts exist. This only considers attempts within the last two years, as attempts
+        before this point are considered expired.
+
+        Parameters:
+            * users: A list of users object of which we are checking the attempts
+            * proctoring_backend: The name of the proctoring backend
+        """
+        earliest_allowed_date = datetime.now(pytz.UTC) - timedelta(days=VERIFICATION_DAYS_VALID)
+        return self.filter(
+            user__in=users, taking_as_proctored=True, proctored_exam__is_practice_exam=True,
+            proctored_exam__backend=proctoring_backend, modified__gt=earliest_allowed_date,
+            status=ProctoredExamStudentAttemptStatus.verified
+        ).order_by('-modified')
+
     def get_filtered_exam_attempts(self, course_id, search_by):
         """
         Returns the Student Exam Attempts for the given course_id filtered by search_by.
         """
-        # EOL: icontains 
+        # EOL: icontains
         filtered_query = Q(proctored_exam__course_id=course_id) & (
             Q(user__username__icontains=search_by) | Q(user__email__icontains=search_by)
         )
@@ -287,6 +352,12 @@ class ProctoredExamStudentAttemptManager(models.Manager):
         # pylint: disable=no-member
         self.filter(user_id=user_id,
                     status__in=ProctoredExamStudentAttemptStatus.onboarding_errors).delete()
+
+    def get_user_attempts_by_exam_id(self, user_id, exam_id):
+        """
+        Returns attempts for a given exam and user
+        """
+        return self.filter(user_id=user_id, proctored_exam_id=exam_id).order_by('-created')
 
 
 class ProctoredExamStudentAttempt(TimeStampedModel):
@@ -348,16 +419,24 @@ class ProctoredExamStudentAttempt(TimeStampedModel):
     # else always false
     is_status_acknowledged = models.BooleanField(default=False)
 
+    # if the attempt enters an error state, the remaining time should
+    # be saved in order to allow the learner to resume
+    time_remaining_seconds = models.IntegerField(null=True)
+
+    # marks whether the attempt is able to be resumed by user
+    # Only those attempts which had an error state before, but
+    # has not yet marked submitted is resumable.
+    is_resumable = models.BooleanField(default=False, verbose_name=ugettext_noop("Is Resumable"))
+
     class Meta:
         """ Meta class for this Django model """
         db_table = 'proctoring_proctoredexamstudentattempt'
         verbose_name = 'proctored exam attempt'
-        unique_together = (('user', 'proctored_exam'),)
 
     @classmethod
     def create_exam_attempt(cls, exam_id, user_id, student_name, attempt_code,
                             taking_as_proctored, is_sample_attempt, external_id,
-                            review_policy_id=None, status=None):
+                            review_policy_id=None, status=None, time_remaining_seconds=None):
         """
         Create a new exam attempt entry for a given exam_id and
         user_id.
@@ -372,7 +451,8 @@ class ProctoredExamStudentAttempt(TimeStampedModel):
             is_sample_attempt=is_sample_attempt,
             external_id=external_id,
             status=status,
-            review_policy_id=review_policy_id
+            review_policy_id=review_policy_id,
+            time_remaining_seconds=time_remaining_seconds
         )  # pylint: disable=no-member
 
     def delete_exam_attempt(self):
@@ -437,6 +517,11 @@ class ProctoredExamStudentAttemptHistory(TimeStampedModel):
     last_poll_timestamp = models.DateTimeField(null=True)
     last_poll_ipaddr = models.CharField(max_length=32, null=True)
 
+    # Marks whether the attempt at this current state is able to be resumed by user
+    # Only those attempts which had an error state before, but
+    # has not yet marked submitted is resumable.
+    is_resumable = models.BooleanField(default=False)
+
     @classmethod
     def get_exam_attempt_by_code(cls, attempt_code):
         """
@@ -485,7 +570,7 @@ class QuerySetWithUpdateOverride(models.QuerySet):
     """
     def update(self, **kwargs):
         """ Create a copy after update """
-        super(QuerySetWithUpdateOverride, self).update(**kwargs)
+        super().update(**kwargs)
         archive_model(ProctoredExamStudentAllowanceHistory, self.get(), id='allowance_id')
 
 
@@ -596,7 +681,11 @@ class ProctoredExamStudentAllowance(TimeStampedModel):
 
         exam = ProctoredExam.get_exam_by_id(exam_id)
         if exam and not exam.is_active:
-            raise ProctoredExamNotActiveException
+            err_msg = (
+                'Attempted to add an allowance for user_id={user_id} in exam_id={exam_id}, but '
+                'this exam is not active.'.format(user_id=user_id, exam_id=exam_id)
+            )
+            raise ProctoredExamNotActiveException(err_msg)
 
         try:
             student_allowance = cls.objects.get(proctored_exam_id=exam_id, user_id=user_id, key=key)
@@ -682,6 +771,9 @@ class ProctoredExamSoftwareSecureReview(TimeStampedModel):
     # which student attempt is this feedback for?
     attempt_code = models.CharField(max_length=255, db_index=True, unique=True)
 
+    # is this attempt active?
+    is_attempt_active = models.BooleanField(default=True)
+
     # overall status of the review
     review_status = models.CharField(max_length=255)
 
@@ -753,6 +845,9 @@ class ProctoredExamSoftwareSecureReviewHistory(TimeStampedModel):
 
     # which student attempt is this feedback for?
     attempt_code = models.CharField(max_length=255, db_index=True)
+
+    # is this attempt active?
+    is_attempt_active = models.BooleanField(default=True)
 
     # overall status of the review
     review_status = models.CharField(max_length=255)

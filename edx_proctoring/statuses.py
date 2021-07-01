@@ -65,6 +65,15 @@ class ProctoredExamStudentAttemptStatus:
     # the course end date has passed
     expired = 'expired'
 
+    # the learner is ready to resume their errored proctored exam
+    ready_to_resume = 'ready_to_resume'
+
+    # the exam has been resumed and new attempt has been created
+    resumed = 'resumed'
+
+    # the onboarding attempt has been reset
+    onboarding_reset = 'onboarding_reset'
+
     # onboarding failure states
     # the user hasn't taken an onboarding exam
     onboarding_missing = 'onboarding_missing'
@@ -85,7 +94,7 @@ class ProctoredExamStudentAttemptStatus:
         """
         return status in [
             cls.declined, cls.timed_out, cls.submitted, cls.second_review_required,
-            cls.verified, cls.rejected, cls.error,
+            cls.verified, cls.rejected, cls.error, cls.ready_to_resume, cls.resumed,
             cls.onboarding_missing, cls.onboarding_pending, cls.onboarding_failed, cls.onboarding_expired
         ]
 
@@ -150,6 +159,15 @@ class ProctoredExamStudentAttemptStatus:
         """
         return status in [
             cls.started, cls.ready_to_submit
+        ]
+
+    @classmethod
+    def is_resume_status(cls, status):
+        """
+        Returns a boolean if the status passed is "resumed" or "ready to resume"
+        """
+        return status in [
+            cls.ready_to_resume, cls.resumed
         ]
 
 
@@ -217,3 +235,121 @@ class SoftwareSecureReviewStatus:
             )
             raise ProctoredExamBadReviewStatus(err_msg)
         return True
+
+
+class InstructorDashboardOnboardingAttemptStatus:
+    """
+    A class to enumerate the different statuses a proctored exam attempt
+    in an onboarding exam can have and to map them to internal database statutes.
+    These are intended to be used in externally facing applications, such
+    as the Instructor Dashboard.
+    """
+    not_started = 'not_started'
+    setup_started = 'setup_started'
+    onboarding_started = 'onboarding_started'
+    submitted = 'submitted'
+    rejected = 'rejected'
+    verified = 'verified'
+    error = 'error'
+    expired = 'expired'
+
+    # The following status is not a true attempt status, but is used when the
+    # user's onboarding profile is approved in a different course.
+    other_course_approved = 'other_course_approved'
+
+    # The following status is not a true attempt status that has a corresponding database
+    # state. This is a consequence of a bug in our software that allows a learner to end up
+    # with their only or their most recent exam attempt being in the "onboarding_reset" state.
+    # The learner should not end up in this state, but while we work on a fix, we should not
+    # display "null" in the Instructor Dashboard Student Onboarding Panel.
+    # TODO: remove as part of MST-745
+    onboarding_reset_past_due = 'onboarding_reset_past_due'
+
+    onboarding_statuses = {
+        ProctoredExamStudentAttemptStatus.created: setup_started,
+        ProctoredExamStudentAttemptStatus.download_software_clicked: setup_started,
+        ProctoredExamStudentAttemptStatus.ready_to_start: setup_started,
+        ProctoredExamStudentAttemptStatus.started: onboarding_started,
+        ProctoredExamStudentAttemptStatus.ready_to_submit: onboarding_started,
+        ProctoredExamStudentAttemptStatus.submitted: submitted,
+        ProctoredExamStudentAttemptStatus.rejected: rejected,
+        ProctoredExamStudentAttemptStatus.verified: verified,
+        ProctoredExamStudentAttemptStatus.error: error,
+        ProctoredExamStudentAttemptStatus.expired: expired
+    }
+
+    @classmethod
+    def get_onboarding_status_from_attempt_status(cls, status):
+        """
+        Get the externally facing proctored exam attempt onboarding status
+        from an internal database proctored exam attempt status.
+
+        Parameters:
+            * status: a ProctoredExamStudentAttemptStatus status
+        """
+        if status:
+            return cls.onboarding_statuses.get(status)
+        return cls.not_started
+
+
+class VerificientOnboardingProfileStatus:
+    """
+    A class for mapping onboarding statuses from Verificient's onboarding status endpoint to
+    internal database values.
+    """
+    no_profile = 'no-profile'
+    approved = 'approved-in-course'
+    other_course_approved = 'approved-in-different-course'
+    rejected = 'rejected'
+    expired = 'expired'
+    pending = 'pending'
+
+    profile_status_mapping = {
+        no_profile: None,
+        approved: InstructorDashboardOnboardingAttemptStatus.verified,
+        other_course_approved: InstructorDashboardOnboardingAttemptStatus.other_course_approved,
+        rejected: InstructorDashboardOnboardingAttemptStatus.rejected,
+        expired: InstructorDashboardOnboardingAttemptStatus.expired,
+        pending: InstructorDashboardOnboardingAttemptStatus.submitted
+    }
+
+    filter_status_mapping = {
+        InstructorDashboardOnboardingAttemptStatus.not_started: no_profile,
+        InstructorDashboardOnboardingAttemptStatus.submitted: pending,
+        InstructorDashboardOnboardingAttemptStatus.other_course_approved: other_course_approved,
+        InstructorDashboardOnboardingAttemptStatus.verified: approved,
+        InstructorDashboardOnboardingAttemptStatus: rejected,
+        InstructorDashboardOnboardingAttemptStatus.expired: expired
+    }
+
+    @classmethod
+    def get_edx_status_from_profile_status(cls, api_status):
+        """
+        Get the internal attempt status given a status from the onboarding api
+
+        Parameters:
+            * status (str): status from Verficient's onboarding API endpoint
+        """
+        return cls.profile_status_mapping.get(api_status)
+
+    @classmethod
+    def get_profile_status_from_filter(cls, filter_status):
+        """
+        Get the verificient profile status given an edx status for filtering
+
+        Parameters:
+            * status (str): edX onboarding status
+        """
+        return cls.filter_status_mapping.get(filter_status)
+
+    @classmethod
+    def get_instructor_status_from_profile_status(cls, api_status):
+        """
+        Get the instructor onboarding status given a status from the onboarding api
+
+        Parameters:
+            * status (str): status from Verficient's onboarding API endpoint
+        """
+        if api_status == cls.no_profile:
+            return InstructorDashboardOnboardingAttemptStatus.not_started
+        return cls.get_edx_status_from_profile_status(api_status)

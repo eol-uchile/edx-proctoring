@@ -27,6 +27,29 @@ from edx_proctoring.statuses import ProctoredExamStudentAttemptStatus
 from edx_proctoring.utils import locate_attempt_by_attempt_code
 
 
+class ProctoredExamForm(forms.ModelForm):
+    """
+    Admin form for reading/updating a Proctored Exam
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields['external_id'].required = False
+        self.fields['due_date'].required = False
+        self.fields['backend'].required = False
+
+    class Meta:
+        model = ProctoredExam
+        fields = '__all__'
+
+
+class ProctoredExamAdmin(admin.ModelAdmin):
+    """
+    Admin panel for Proctored Exams
+    """
+    form = ProctoredExamForm
+    search_fields = ['course_id', 'exam_name']
+
+
 class ProctoredExamReviewPolicyAdmin(admin.ModelAdmin):
     """
     The admin panel for Review Policies
@@ -228,7 +251,7 @@ class ProctoredExamSoftwareSecureReviewAdmin(admin.ModelAdmin):
     The admin panel for SoftwareSecure Review records
     """
 
-    readonly_fields = ['attempt_code', 'exam', 'student', 'reviewed_by', 'modified']
+    readonly_fields = ['attempt_code', 'is_attempt_active', 'exam', 'student', 'reviewed_by', 'modified']
     list_filter = [
         ReviewListFilter,
         ProctoredExamListFilter,
@@ -271,6 +294,7 @@ class ProctoredExamSoftwareSecureReviewAdmin(admin.ModelAdmin):
         'exam_name_for_review',
         'student_username_for_review',
         'attempt_code',
+        'is_attempt_active',
         'modified',
         'reviewed_by',
         'review_status'
@@ -293,7 +317,7 @@ class ProctoredExamSoftwareSecureReviewAdmin(admin.ModelAdmin):
 
     def get_form(self, request, obj=None, change=False, **kwargs):
         """ Returns software secure review form """
-        form = super(ProctoredExamSoftwareSecureReviewAdmin, self).get_form(request, obj, change, **kwargs)
+        form = super().get_form(request, obj, change, **kwargs)
         if 'video_url' in form.base_fields:
             del form.base_fields['video_url']
         return form
@@ -302,7 +326,7 @@ class ProctoredExamSoftwareSecureReviewAdmin(admin.ModelAdmin):
         """ Checks if lookup allowed or not """
         if key == 'exam__course_id':
             return True
-        return super(ProctoredExamSoftwareSecureReviewAdmin, self).lookup_allowed(key, value)
+        return super().lookup_allowed(key, value)
 
 
 class ProctoredExamSoftwareSecureReviewHistoryAdmin(ProctoredExamSoftwareSecureReviewAdmin):
@@ -382,6 +406,7 @@ class ProctoredExamAttemptForm(forms.ModelForm):
         (ProctoredExamStudentAttemptStatus.verified, _('Verified')),
         (ProctoredExamStudentAttemptStatus.rejected, _('Rejected')),
         (ProctoredExamStudentAttemptStatus.error, _('Error')),
+        (ProctoredExamStudentAttemptStatus.ready_to_resume, _('Ready To Resume')),
     ]
     if settings.DEBUG:
         STATUS_CHOICES.extend([
@@ -412,7 +437,8 @@ class ProctoredExamStudentAttemptAdmin(admin.ModelAdmin):
         'is_sample_attempt',
         'student_name',
         'review_policy_id',
-        'is_status_acknowledged'
+        'is_status_acknowledged',
+        'time_remaining_seconds'
     ]
 
     list_display = [
@@ -458,9 +484,11 @@ class ProctoredExamStudentAttemptAdmin(admin.ModelAdmin):
         """
         try:
             if change:
-                update_attempt_status(obj.proctored_exam.id, obj.user.id, form.cleaned_data['status'])
+                update_attempt_status(obj.id, form.cleaned_data['status'])
         except (ProctoredExamIllegalStatusTransition, StudentExamAttemptDoesNotExistsException) as ex:
-            messages.error(request, ex.message)
+            # prevent showing success message inappropriately
+            messages.set_level(request, messages.ERROR)
+            messages.error(request, str(ex))
 
     def has_add_permission(self, request):
         """Don't allow adds"""
@@ -478,6 +506,7 @@ def prettify_course_id(course_id):
     return course_id.replace('+', ' ').replace('/', ' ').replace('course-v1:', '')
 
 
+admin.site.register(ProctoredExam, ProctoredExamAdmin)
 admin.site.register(ProctoredExamStudentAttempt, ProctoredExamStudentAttemptAdmin)
 admin.site.register(ProctoredExamReviewPolicy, ProctoredExamReviewPolicyAdmin)
 admin.site.register(ProctoredExamSoftwareSecureReview, ProctoredExamSoftwareSecureReviewAdmin)

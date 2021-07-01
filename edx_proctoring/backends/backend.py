@@ -20,6 +20,11 @@ class ProctoringBackendProvider(metaclass=abc.ABCMeta):
     has_dashboard = False
     # whether practice exams map to "onboarding" exams for this backend
     supports_onboarding = False
+    help_center_article_url = ''
+
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
 
     @abc.abstractmethod
     def register_exam_attempt(self, exam, context):
@@ -127,3 +132,10 @@ class ProctoringBackendProvider(metaclass=abc.ABCMeta):
         Whether learner access to exam content should be blocked during the exam
         """
         return False
+
+    # pylint: disable=unused-argument
+    def get_onboarding_profile_info(self, course_id, **kwargs):
+        """
+        Returns onboarding profile information for a given course and optional user
+        """
+        return None

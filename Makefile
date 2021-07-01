@@ -31,18 +31,32 @@ upgrade: export CUSTOM_COMPILE_COMMAND=make upgrade
 upgrade: ## update the requirements/*.txt files with the latest packages satisfying requirements/*.in
 	pip install -q pip-tools
 	pip-compile --rebuild --upgrade -o requirements/base.txt requirements/base.in
+	pip-compile --rebuild --upgrade -o requirements/ci.txt requirements/ci.in
 	pip-compile --rebuild --upgrade -o requirements/dev.txt requirements/dev.in
 	pip-compile --rebuild --upgrade -o requirements/doc.txt requirements/doc.in
+	pip-compile --rebuild --upgrade -o requirements/pip.txt requirements/pip.in
 	pip-compile --rebuild --upgrade -o requirements/quality.txt requirements/quality.in
 	pip-compile --rebuild --upgrade -o requirements/test.txt requirements/test.in
 	# Let tox control the Django and djangorestframework versions for tests
+	grep -e "^amqp==\|^anyjson==\|^billiard==\|^celery==\|^kombu==\|^click-didyoumean==\|^click-repl==\|^click==\|^prompt-toolkit==\|^vine==" requirements/base.txt > requirements/celery50.txt
 	sed -i.tmp '/^[d|D]jango==/d' requirements/test.txt
 	sed -i.tmp '/^djangorestframework==/d' requirements/test.txt
+	sed -i.tmp '/^amqp==/d' requirements/test.txt
+	sed -i.tmp '/^anyjson==/d' requirements/test.txt
+	sed -i.tmp '/^billiard==/d' requirements/test.txt
+	sed -i.tmp '/^celery==/d' requirements/test.txt
+	sed -i.tmp '/^kombu==/d' requirements/test.txt
+	sed -i.tmp '/^click-didyoumean==/d' requirements/test.txt
+	sed -i.tmp '/^click-repl==/d' requirements/test.txt
+	sed -i.tmp '/^click==/d' requirements/test.txt
+	sed -i.tmp '/^click==/d' requirements/test.txt
+	sed -i.tmp '/^prompt-toolkit==/d' requirements/test.txt
+	sed -i.tmp '/^vine==/d' requirements/test.txt
 	rm requirements/test.txt.tmp
 
 requirements: ## install development environment requirements
 	pip install -qr requirements/dev.txt --exists-action w
-	pip-sync requirements/*.txt requirements/private.*
+	pip-sync requirements/dev.txt requirements/base.txt requirements/private.*
 
 install: requirements
 	./manage.py migrate --settings=test_settings
@@ -65,7 +79,10 @@ quality-js: lint-js
 quality-python: ## Run python linters
 	tox -e quality
 
-quality: quality-js quality-python ## Run linters
+quality-rst: ## validate rst files
+	rstcheck -r --report warning .
+
+quality: quality-js quality-python quality-rst ## Run linters
 
 test-python: clean ## run tests in the current virtualenv
 	pip install -e .
